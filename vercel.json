@@ -1,0 +1,15 @@
+{
+  "functions": {
+    "api/create-checkout-session.js": {
+      "memory": 128,
+      "maxDuration": 5
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/create-checkout-session",
+      "methods": ["POST"],
+      "dest": "api/create-checkout-session.js"
+    }
+  ]
+}
