@@ -6,11 +6,18 @@ module.exports = async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items: lineItems,
-      mode: 'payment', // Ou 'subscription' si abonnement récurrent
+      line_items: lineItems.map(item => ({
+        ...item,
+        price_data: {
+          ...item.price_data,
+          recurring: { interval: 'month' } // Mensuel, change en 'year' si annuel
+        }
+      })),
+      mode: 'subscription', // Mode abonnement récurrent
+      billing_address_collection: 'auto', // Collecte l'adresse pour factures
       success_url: `https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `https://aleopplatform.webflow.io/cancel`,
-      metadata: { memberId, licences: JSON.stringify(lineItems.map(item => item.description)) }, // Ajoute les détails des licences dans metadata
+      metadata: { memberId, licences: JSON.stringify(lineItems.map(item => item.description)) },
     });
     res.status(200).json({ sessionId: session.id });
   } catch (error) {
