@@ -1,7 +1,7 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
-const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize';
+const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize'; // Ton ID plan général
 
 module.exports = async (req, res) => {
   let body = '';
@@ -24,7 +24,6 @@ module.exports = async (req, res) => {
 
   let selectedPrograms = [];
   let customerEmail;
-  let memberIdFromMetadata;
   let isDelete = false;
   let isFailure = false;
 
@@ -33,12 +32,38 @@ module.exports = async (req, res) => {
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
-      memberIdFromMetadata = session.metadata.memberstack_id;
-      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail);
       break;
 
-    // Other cases as before, add memberIdFromMetadata = sub.metadata.memberstack_id if needed for updated/paid (but for simplicity, use email fallback)
-    // ...
+    case 'customer.subscription.updated':
+      const sub = event.data.object;
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+      customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+      console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail);
+      break;
+
+    case 'customer.subscription.deleted':
+      isDelete = true;
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Deleted: Email', customerEmail);
+      break;
+
+    case 'invoice.paid':
+      const invoice = event.data.object;
+      const subId = invoice.subscription;
+      if (subId) {
+        const sub = await stripe.subscriptions.retrieve(subId);
+        selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+        customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+        console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail);
+      }
+      break;
+
+    case 'invoice.payment_failed':
+      isFailure = true;
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Failed: Email', customerEmail);
+      break;
 
     default:
       console.log('Ignored event: ' + event.type);
@@ -46,11 +71,8 @@ module.exports = async (req, res) => {
       return;
   }
 
-  let memberId = memberIdFromMetadata; // Prefer metadata ID
-  if (!memberId) {
-    memberId = await getMemberIdByEmail(customerEmail); // Fallback to email
-  }
-  console.log('Member ID used: ' + memberId);
+  const memberId = await getMemberIdByEmail(customerEmail);
+  console.log('Member ID found: ' + memberId);
   if (memberId) {
     if (isDelete || isFailure) {
       await removeMemberPlan(memberId, GENERAL_PLAN_ID);
@@ -62,10 +84,58 @@ module.exports = async (req, res) => {
       console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
     }
   } else {
-    console.log('No member found for email ' + customerEmail + ' or metadata ID');
+    console.log('No member found for email ' + customerEmail);
   }
 
   res.send();
 };
 
- // getMemberIdByEmail, addMemberPlan, removeMemberPlan, updateMemberFields, resetMemberFields as before
+async function getMemberIdByEmail(email) {
+  const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
+  const data = await res.json();
+  return data.data[0]?.id;
+}
+
+async function addMemberPlan(memberId, planId) {
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
+    method: 'POST',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId })
+  });
+}
+
+async function removeMemberPlan(memberId, planId) {
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
+    method: 'DELETE',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
+}
+
+async function updateMemberFields(memberId, programs) {
+  const updates = {};
+  programs.forEach(prog => {
+    updates[`programme_${prog}`] = "1";
+  });
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
+  });
+}
+
+async function resetMemberFields(memberId) {
+  const updates = {
+    'programme_athletyx': "0",
+    'programme_booty': "0",
+    'programme_upper': "0",
+    'programme_flow': "0"
+    // Ajoute les autres si besoin
+  };
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
+  });
+}
