@@ -1,7 +1,7 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Pour tests, change à ton domaine Webflow pour sécurité
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') {
@@ -9,8 +9,16 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms } = req.body;
+    const { lineItems, coupon, selectedPrograms, email } = req.body; // Email from front
     try {
+      let customer;
+      const customers = await stripe.customers.search({ query: `email:"${email}"` });
+      if (customers.data.length > 0) {
+        customer = customers.data[0];
+      } else {
+        customer = await stripe.customers.create({ email });
+      }
+
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         payment_method_types: ['card'],
@@ -18,7 +26,8 @@ module.exports = async (req, res) => {
         discounts: coupon ? [{ coupon }] : [],
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(',') }
+        metadata: { selected_programs: selectedPrograms.join(',') },
+        customer: customer.id // Use the customer with correct email
       });
       res.status(200).json({ id: session.id });
     } catch (error) {
