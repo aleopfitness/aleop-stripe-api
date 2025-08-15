@@ -10,32 +10,32 @@ module.exports = async (req, res) => {
   }
   if (req.method === 'POST') {
     const { lineItems, coupon, selectedPrograms, email } = req.body;
-    console.log('Email from front: ' + email); // Log for debug
+    console.log('Email from front: ' + email);
     try {
       let customer;
       const customers = await stripe.customers.search({ query: `email:"${email}"` });
-      if (customers.data.length > 0) {
-        customer = customers.data[0];
-        if (customer.email !== email) {
-          await stripe.customers.update(customer.id, { email });
-          console.log('Updated customer email to ' + email); // Log if updated
-        }
-      } else {
-        customer = await stripe.customers.create({ email });
-      }
-
-      const session = await stripe.checkout.sessions.create({
+      let sessionParams = {
         mode: 'subscription',
         payment_method_types: ['card'],
         line_items: lineItems,
         discounts: coupon ? [{ coupon }] : [],
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(',') },
-        customer: customer.id,
-        customer_email: email // Pre-fill portal
-      });
-      console.log('Session created with customer email: ' + customer.email); // Log final
+        metadata: { selected_programs: selectedPrograms.join(',') }
+      };
+
+      if (customers.data.length > 0) {
+        customer = customers.data[0];
+        if (customer.email !== email) {
+          await stripe.customers.update(customer.id, { email });
+          console.log('Updated customer email to ' + email);
+        }
+        sessionParams.customer = customer.id; // Use customer, no customer_email
+      } else {
+        sessionParams.customer_email = email; // For new, use customer_email
+      }
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
       res.status(200).json({ id: session.id });
     } catch (error) {
       console.log('Error: ' + error.message);
