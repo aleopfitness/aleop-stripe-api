@@ -1,7 +1,7 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
-const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize'; // Ton ID plan général
+const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize';
 
 module.exports = async (req, res) => {
   let body = '';
@@ -24,6 +24,7 @@ module.exports = async (req, res) => {
 
   let selectedPrograms = [];
   let customerEmail;
+  let memberIdFromMetadata;
   let isDelete = false;
   let isFailure = false;
 
@@ -32,14 +33,16 @@ module.exports = async (req, res) => {
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
-      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail);
+      memberIdFromMetadata = session.metadata.memberstack_id;
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
       break;
 
     case 'customer.subscription.updated':
       const sub = event.data.object;
       selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
-      console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail);
+      memberIdFromMetadata = sub.metadata.memberstack_id;
+      console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
       break;
 
     case 'customer.subscription.deleted':
@@ -55,7 +58,8 @@ module.exports = async (req, res) => {
         const sub = await stripe.subscriptions.retrieve(subId);
         selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
-        console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail);
+        memberIdFromMetadata = sub.metadata.memberstack_id;
+        console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
       }
       break;
 
@@ -71,8 +75,11 @@ module.exports = async (req, res) => {
       return;
   }
 
-  const memberId = await getMemberIdByEmail(customerEmail);
-  console.log('Member ID found: ' + memberId);
+  let memberId = memberIdFromMetadata; // Priorise ID from metadata
+  if (!memberId) {
+    memberId = await getMemberIdByEmail(customerEmail); // Fallback email if no ID
+  }
+  console.log('Member ID used: ' + memberId);
   if (memberId) {
     if (isDelete || isFailure) {
       await removeMemberPlan(memberId, GENERAL_PLAN_ID);
@@ -84,7 +91,7 @@ module.exports = async (req, res) => {
       console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
     }
   } else {
-    console.log('No member found for email ' + customerEmail);
+    console.log('No member found for email ' + customerEmail + ' or metadata ID');
   }
 
   res.send();
