@@ -9,8 +9,13 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, memberId } = req.body; // Ajout memberId from front
-    console.log('Member ID from front: ' + memberId); // Log for debug
+    const { lineItems, coupon, selectedPrograms, email } = req.body;
+    if (!email) {
+      console.log('Error: No email provided from front');
+      res.status(400).json({ error: 'No email provided' });
+      return;
+    }
+    console.log('Email from front: ' + email);
     try {
       let customer;
       const customers = await stripe.customers.search({ query: `email:"${email}"` });
@@ -31,9 +36,8 @@ module.exports = async (req, res) => {
         discounts: coupon ? [{ coupon }] : [],
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId }, // Ajout memberId in metadata
-        customer: customer.id,
-        customer_email: email
+        metadata: { selected_programs: selectedPrograms.join(',') },
+        customer: customer.id
       });
       res.status(200).json({ id: session.id });
     } catch (error) {
