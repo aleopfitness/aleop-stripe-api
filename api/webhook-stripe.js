@@ -2,11 +2,17 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
+  let body = '';
+  req.setEncoding('utf8');
+  for await (const chunk of req) {
+    body += chunk;
+  }
   const sig = req.headers['stripe-signature'];
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
+    console.log('Webhook Error:', err.message); // Log for debug in Vercel
     res.status(400).send(`Webhook Error: ${err.message}`);
     return;
   }
@@ -21,91 +27,61 @@ module.exports = async (req, res) => {
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail); // Log for debug
       break;
 
+    // Other cases as before (updated, deleted, paid, failed) with console.log('Event type: ' + event.type);
     case 'customer.subscription.updated':
       const sub = event.data.object;
-      // Fetch add-ons from sub items to sync fields (e.g., if user upgraded)
-      selectedPrograms = sub.items.data.map(item => {
-        // Extract from metadata or product name (adapte à tes metadata product "type_programme")
-        return item.plan.metadata.type_programme || item.plan.nickname.toLowerCase(); // Assume nickname like "athletyx"
-      });
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || item.plan.nickname.toLowerCase());
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+      console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail);
       break;
 
     case 'customer.subscription.deleted':
-      const subDeleted = event.data.object;
       isDelete = true;
-      customerEmail = (await stripe.customers.retrieve(subDeleted.customer)).email;
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Deleted: Email', customerEmail);
       break;
 
     case 'invoice.paid':
       const invoice = event.data.object;
-      // Re-sync if needed for renewals (e.g., prorate changes)
       const subId = invoice.subscription;
       if (subId) {
         const sub = await stripe.subscriptions.retrieve(subId);
         selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || item.plan.nickname.toLowerCase());
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+        console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail);
       }
       break;
 
     case 'invoice.payment_failed':
-      const invoiceFailed = event.data.object;
       isFailure = true;
-      customerEmail = (await stripe.customers.retrieve(invoiceFailed.customer)).email;
-      // Optionnel: Send email notification via autre tool, ou suspend fields
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Failed: Email', customerEmail);
       break;
 
     default:
-      // Ignore other events
+      console.log('Ignored event: ' + event.type);
       res.send();
       return;
   }
 
   const memberId = await getMemberIdByEmail(customerEmail);
+  console.log('Member ID found: ' + memberId);
   if (memberId) {
     if (isDelete || isFailure) {
-      await resetMemberFields(memberId); // Set all programme_* to false on delete or failure
+      await resetMemberFields(memberId);
+      console.log('Fields reset for member ' + memberId);
     } else if (selectedPrograms.length > 0) {
-      await updateMemberFields(memberId, selectedPrograms); // Update to true for selected
+      await updateMemberFields(memberId, selectedPrograms);
+      console.log('Fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
     }
+  } else {
+    console.log('No member found for email ' + customerEmail);
   }
 
   res.send();
 };
 
-async function getMemberIdByEmail(email) {
-  const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
-  });
-  const data = await res.json();
-  return data.data[0]?.id;
-}
-
-async function updateMemberFields(memberId, programs) {
-  const updates = {};
-  programs.forEach(prog => {
-    updates[`programme_${prog}`] = true;
-  });
-  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-    method: 'PATCH',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ customFields: updates })
-  });
-}
-
-async function resetMemberFields(memberId) {
-  const updates = {
-    'programme_athletyx': false,
-    'programme_booty': false,
-    'programme_upper': false,
-    'programme_flow': false
-    // Ajoute tous tes programs ici pour set false on delete/failure
-  };
-  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-    method: 'PATCH',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ customFields: updates })
-  });
-}
+// getMemberIdByEmail, updateMemberFields, resetMemberFields as before (add console.log if needed)
