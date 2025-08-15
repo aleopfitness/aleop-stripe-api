@@ -10,6 +10,7 @@ module.exports = async (req, res) => {
   }
   if (req.method === 'POST') {
     const { lineItems, coupon, selectedPrograms, email } = req.body;
+    console.log('Body received from front: ', req.body); // Log full body for debug
     if (!email) {
       console.log('Error: No email provided from front');
       res.status(400).json({ error: 'No email provided' });
