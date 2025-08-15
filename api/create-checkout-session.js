@@ -9,36 +9,34 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, email } = req.body;
-    console.log('Email from front: ' + email);
+    const { lineItems, coupon, selectedPrograms, memberId } = req.body; // Ajout memberId from front
+    console.log('Member ID from front: ' + memberId); // Log for debug
     try {
       let customer;
       const customers = await stripe.customers.search({ query: `email:"${email}"` });
-      let sessionParams = {
-        mode: 'subscription',
-        payment_method_types: ['card'],
-        line_items: lineItems,
-        discounts: coupon ? [{ coupon }] : [],
-        success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
-        cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(',') }
-      };
-
       if (customers.data.length > 0) {
         customer = customers.data[0];
         if (customer.email !== email) {
           await stripe.customers.update(customer.id, { email });
           console.log('Updated customer email to ' + email);
         }
-        sessionParams.customer = customer.id; // Use customer, no customer_email
       } else {
-        sessionParams.customer_email = email; // For new, use customer_email
+        customer = await stripe.customers.create({ email });
       }
 
-      const session = await stripe.checkout.sessions.create(sessionParams);
+      const session = await stripe.checkout.sessions.create({
+        mode: 'subscription',
+        payment_method_types: ['card'],
+        line_items: lineItems,
+        discounts: coupon ? [{ coupon }] : [],
+        success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
+        cancel_url: 'https://aleopplatform.webflow.io/cancel',
+        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId }, // Ajout memberId in metadata
+        customer: customer.id,
+        customer_email: email
+      });
       res.status(200).json({ id: session.id });
     } catch (error) {
-      console.log('Error: ' + error.message);
       res.status(500).json({ error: error.message });
     }
   } else {
