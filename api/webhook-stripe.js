@@ -2,14 +2,13 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  let body;
-  try {
-    body = await getRawBody(req); // Read raw body
-  } catch (err) {
-    console.log('Raw body error:', err.message);
-    res.status(400).send('Raw body read error');
-    return;
-  }
+  let body = '';
+  req.setEncoding('utf8');
+  req.on('data', chunk => {
+    body += chunk;
+  });
+
+  await new Promise((resolve) => req.on('end', resolve));
 
   const sig = req.headers['stripe-signature'];
   let event;
@@ -87,17 +86,37 @@ module.exports = async (req, res) => {
   res.send();
 };
 
-function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
-      resolve(body);
-    });
-    req.on('error', reject);
+async function getMemberIdByEmail(email) {
+  const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
+  const data = await res.json();
+  return data.data[0]?.id;
+}
+
+async function updateMemberFields(memberId, programs) {
+  const updates = {};
+  programs.forEach(prog => {
+    updates[`programme_${prog}`] = true;
+  });
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
   });
 }
 
-// getMemberIdByEmail, updateMemberFields, resetMemberFields as before
+async function resetMemberFields(memberId) {
+  const updates = {
+    'programme_athletyx': false,
+    'programme_booty': false,
+    'programme_upper': false,
+    'programme_flow': false
+    // Ajoute les autres programs ici
+  };
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
+  });
+}
