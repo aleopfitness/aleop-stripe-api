@@ -2,17 +2,12 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  let body = '';
-  req.setEncoding('utf8');
-  for await (const chunk of req) {
-    body += chunk;
-  }
   const sig = req.headers['stripe-signature'];
   let event;
   try {
-    event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.log('Webhook Error:', err.message); // Log for debug in Vercel
+    console.log('Webhook Error:', err.message);
     res.status(400).send(`Webhook Error: ${err.message}`);
     return;
   }
@@ -27,13 +22,15 @@ module.exports = async (req, res) => {
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
-      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail); // Log for debug
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail);
       break;
 
-    // Other cases as before (updated, deleted, paid, failed) with console.log('Event type: ' + event.type);
     case 'customer.subscription.updated':
       const sub = event.data.object;
-      selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || item.plan.nickname.toLowerCase());
+      selectedPrograms = sub.items.data.map(item => {
+        const prog = item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null);
+        return prog ? prog : null; // Skip if null
+      }).filter(prog => prog !== null); // Filter nulls to avoid crash
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
       console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail);
       break;
@@ -49,7 +46,10 @@ module.exports = async (req, res) => {
       const subId = invoice.subscription;
       if (subId) {
         const sub = await stripe.subscriptions.retrieve(subId);
-        selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || item.plan.nickname.toLowerCase());
+        selectedPrograms = sub.items.data.map(item => {
+          const prog = item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null);
+          return prog ? prog : null;
+        }).filter(prog => prog !== null);
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
         console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail);
       }
@@ -84,4 +84,4 @@ module.exports = async (req, res) => {
   res.send();
 };
 
-// getMemberIdByEmail, updateMemberFields, resetMemberFields as before (add console.log if needed)
+// getMemberIdByEmail, updateMemberFields, resetMemberFields as before
