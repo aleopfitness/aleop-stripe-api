@@ -9,7 +9,7 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, memberId } = req.body; // Ajout memberId from front
+    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // Ajout memberId from front
     console.log('Member ID from front: ' + memberId); // Log for debug
     try {
       let customer;
