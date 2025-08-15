@@ -1,6 +1,8 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
+const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize'; // Ton ID plan général
+
 module.exports = async (req, res) => {
   let body = '';
   req.setEncoding('utf8');
@@ -73,11 +75,13 @@ module.exports = async (req, res) => {
   console.log('Member ID found: ' + memberId);
   if (memberId) {
     if (isDelete || isFailure) {
+      await removeMemberPlan(memberId, GENERAL_PLAN_ID);
       await resetMemberFields(memberId);
-      console.log('Fields reset for member ' + memberId);
+      console.log('Plan removed and fields reset for member ' + memberId);
     } else if (selectedPrograms.length > 0) {
+      await addMemberPlan(memberId, GENERAL_PLAN_ID);
       await updateMemberFields(memberId, selectedPrograms);
-      console.log('Fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
+      console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
     }
   } else {
     console.log('No member found for email ' + customerEmail);
@@ -94,10 +98,25 @@ async function getMemberIdByEmail(email) {
   return data.data[0]?.id;
 }
 
+async function addMemberPlan(memberId, planId) {
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
+    method: 'POST',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId })
+  });
+}
+
+async function removeMemberPlan(memberId, planId) {
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
+    method: 'DELETE',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
+}
+
 async function updateMemberFields(memberId, programs) {
   const updates = {};
   programs.forEach(prog => {
-    updates[`programme_${prog}`] = true;
+    updates[`programme_${prog}`] = "1";
   });
   await fetch(`https://admin.memberstack.com/members/${memberId}`, {
     method: 'PATCH',
@@ -108,11 +127,11 @@ async function updateMemberFields(memberId, programs) {
 
 async function resetMemberFields(memberId) {
   const updates = {
-    'programme_athletyx': false,
-    'programme_booty': false,
-    'programme_upper': false,
-    'programme_flow': false
-    // Ajoute les autres programs ici
+    'programme_athletyx': "0",
+    'programme_booty': "0",
+    'programme_upper': "0",
+    'programme_flow': "0"
+    // Ajoute les autres si besoin
   };
   await fetch(`https://admin.memberstack.com/members/${memberId}`, {
     method: 'PATCH',
