@@ -2,10 +2,19 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
+  let body;
+  try {
+    body = await getRawBody(req); // Read raw body
+  } catch (err) {
+    console.log('Raw body error:', err.message);
+    res.status(400).send('Raw body read error');
+    return;
+  }
+
   const sig = req.headers['stripe-signature'];
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.log('Webhook Error:', err.message);
     res.status(400).send(`Webhook Error: ${err.message}`);
@@ -27,10 +36,7 @@ module.exports = async (req, res) => {
 
     case 'customer.subscription.updated':
       const sub = event.data.object;
-      selectedPrograms = sub.items.data.map(item => {
-        const prog = item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null);
-        return prog ? prog : null; // Skip if null
-      }).filter(prog => prog !== null); // Filter nulls to avoid crash
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
       console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail);
       break;
@@ -46,10 +52,7 @@ module.exports = async (req, res) => {
       const subId = invoice.subscription;
       if (subId) {
         const sub = await stripe.subscriptions.retrieve(subId);
-        selectedPrograms = sub.items.data.map(item => {
-          const prog = item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null);
-          return prog ? prog : null;
-        }).filter(prog => prog !== null);
+        selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
         console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail);
       }
@@ -83,5 +86,18 @@ module.exports = async (req, res) => {
 
   res.send();
 };
+
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      resolve(body);
+    });
+    req.on('error', reject);
+  });
+}
 
 // getMemberIdByEmail, updateMemberFields, resetMemberFields as before
