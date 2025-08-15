@@ -1,8 +1,6 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
-const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize'; // Ton ID plan général
-
 module.exports = async (req, res) => {
   let body = '';
   req.setEncoding('utf8');
@@ -139,3 +137,4 @@ async function resetMemberFields(memberId) {
     body: JSON.stringify({ customFields: updates })
   });
 }
+```
