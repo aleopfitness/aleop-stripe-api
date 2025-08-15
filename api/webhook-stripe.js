@@ -1,6 +1,8 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
+const GENERAL_PLAN_ID = 'pln_aleop-team-plan-ir1n30ize'; // Ton ID plan général
+
 module.exports = async (req, res) => {
   let body = '';
   req.setEncoding('utf8');
@@ -99,42 +101,4 @@ async function getMemberIdByEmail(email) {
 async function addMemberPlan(memberId, planId) {
   await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
     method: 'POST',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ planId })
-  });
-}
-
-async function removeMemberPlan(memberId, planId) {
-  await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
-    method: 'DELETE',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
-  });
-}
-
-async function updateMemberFields(memberId, programs) {
-  const updates = {};
-  programs.forEach(prog => {
-    updates[`programme_${prog}`] = "1";
-  });
-  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-    method: 'PATCH',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ customFields: updates })
-  });
-}
-
-async function resetMemberFields(memberId) {
-  const updates = {
-    'programme_athletyx': "0",
-    'programme_booty': "0",
-    'programme_upper': "0",
-    'programme_flow': "0"
-    // Ajoute les autres si besoin
-  };
-  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-    method: 'PATCH',
-    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ customFields: updates })
-  });
-}
-```
+    headers: { 'X-API-KEY': process.env.MEMBER
