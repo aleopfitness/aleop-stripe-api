@@ -77,7 +77,8 @@ module.exports = async (req, res) => {
 
   let memberId = memberIdFromMetadata; // Priorise ID from metadata
   if (!memberId) {
-    memberId = await getMemberIdByEmail(customerEmail); // Fallback email if no ID
+    console.log('No memberId in metadata, fallback to email search');
+    memberId = await getMemberIdByEmail(customerEmail); // Fallback email
   }
   console.log('Member ID used: ' + memberId);
   if (memberId) {
