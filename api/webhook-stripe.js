@@ -79,6 +79,8 @@ module.exports = async (req, res) => {
         await addMemberPlan(memberId, GENERAL_PLAN_ID);
         await updateMemberFields(memberId, selectedPrograms);
         console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
+      } else {
+        console.log('Skipped update for ' + event.type + ' as programs empty');
       }
     } catch (err) {
       console.error('Erreur lors de l\'update Memberstack pour member ' + memberId + ' : ', err.message);
@@ -95,7 +97,10 @@ async function getMemberIdByEmail(email) {
     });
     const data = await res.json();
     console.log('Recherche Member par email ' + email + ' : ' + data.data.length + ' résultats trouvés');
-    return data.data[0]?.id;
+    if (data.data.length > 1) {
+      console.warn('Warning: Multiple members for email ' + email + ', taking the last (newest) one');
+    }
+    return data.data[data.data.length - 1]?.id || null; // Prend le dernier
   } catch (err) {
     console.error('Erreur getMemberIdByEmail : ', err.message);
     return null;
