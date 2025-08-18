@@ -8,8 +8,8 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body;
-    console.log('Member ID from front: ' + memberId);
+    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // Ajout memberId from front
+    console.log('Member ID from front: ' + memberId); // Log for debug
     console.log('Email from front: ' + email);
     try {
       let customer;
@@ -30,8 +30,8 @@ module.exports = async (req, res) => {
         discounts: coupon ? [{ coupon }] : [],
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId },
-        subscription_data: { metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId } }, // Propagation à subscription
+        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId }, // Metadata on session
+        subscription_data: { metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId } }, // Propagation to subscription
         customer: customer.id
       });
       res.status(200).json({ id: session.id });
