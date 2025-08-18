@@ -1,240 +1,180 @@
-// /api/stripe-webhook.js
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
-
-// ✅ Ton plan (FREE) Memberstack
-const GENERAL_PLAN_ID = 'pln_aleop-access-tdig0eq7';
-
+const GENERAL_PLAN_ID = 'pln_aleop-access-tdig0eq7'; // Vérifie cet ID exact dans dashboard
 module.exports = async (req, res) => {
-  // Lire le RAW body (important pour vérifier la signature Stripe)
   let body = '';
   req.setEncoding('utf8');
-  req.on('data', (chunk) => { body += chunk; });
+  req.on('data', chunk => {
+    body += chunk;
+  });
   await new Promise((resolve) => req.on('end', resolve));
-
   const sig = req.headers['stripe-signature'];
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.log('Webhook Error:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+    return;
   }
-
-  // -------- Helpers --------
-  const parsePrograms = (meta) =>
-    meta?.selected_programs ? meta.selected_programs.split(',').map(s => s.trim()).filter(Boolean) : [];
-
-  const updatesFrom = (programs) => {
-    const updates = {};
-    programs.forEach(p => { updates[p] = "1"; }); // tes clés custom avec tirets (ex: 'upper-shape')
-    return updates;
+  let selectedPrograms = [];
+  let customerEmail;
+  let memberIdFromMetadata;
+  let isDelete = false;
+  let isFailure = false;
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
+      customerEmail = session.customer_details.email;
+      memberIdFromMetadata = session.metadata.memberstack_id;
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
+      break;
+    case 'customer.subscription.updated':
+      const sub = event.data.object;
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+      customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+      memberIdFromMetadata = sub.metadata.memberstack_id;
+      console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
+      break;
+    case 'customer.subscription.deleted':
+      isDelete = true;
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Deleted: Email', customerEmail);
+      break;
+    case 'invoice.paid':
+      const invoice = event.data.object;
+      const subId = invoice.subscription;
+      if (subId) {
+        const sub = await stripe.subscriptions.retrieve(subId);
+        selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+        customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
+        memberIdFromMetadata = sub.metadata.memberstack_id;
+        console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
+      }
+      break;
+    case 'invoice.payment_failed':
+      isFailure = true;
+      customerEmail = (await stripe.customers.retrieve(event.data.object.customer)).email;
+      console.log('Failed: Email', customerEmail);
+      break;
+    default:
+      console.log('Ignored event: ' + event.type);
+      res.send();
+      return;
+  }
+  let memberId = memberIdFromMetadata;
+  if (!memberId) {
+    memberId = await getMemberIdByEmail(customerEmail);
+    console.log('Fallback email utilisé pour ' + customerEmail + ', ID trouvé : ' + memberId);
+  }
+  console.log('Member ID used: ' + memberId);
+  if (memberId) {
+    try {
+      if (isDelete || isFailure) {
+        await removeMemberPlan(memberId, GENERAL_PLAN_ID);
+        await resetMemberFields(memberId);
+        console.log('Plan removed and fields reset for member ' + memberId);
+      } else if (selectedPrograms.length > 0) {
+        await addMemberPlan(memberId, GENERAL_PLAN_ID);
+        await updateMemberFields(memberId, selectedPrograms);
+        console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
+      } else {
+        console.log('Skipped update for ' + event.type + ' as programs empty');
+      }
+    } catch (err) {
+      console.error('Erreur lors de l\'update Memberstack pour member ' + memberId + ' : ', err.message);
+    }
+  } else {
+    console.log('No member found for email ' + customerEmail + ' or metadata ID');
+  }
+  res.send();
+};
+async function getMemberIdByEmail(email) {
+  try {
+    const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+    });
+    const data = await res.json();
+    console.log('Recherche Member par email ' + email + ' : ' + data.data.length + ' résultats trouvés');
+    if (data.data.length > 1) {
+      console.warn('Warning: Multiple members for email ' + email + ', taking the last (newest) one');
+    }
+    return data.data[data.data.length - 1]?.id || null;
+  } catch (err) {
+    console.error('Erreur getMemberIdByEmail : ', err.message);
+    return null;
+  }
+}
+async function addMemberPlan(memberId, planId) {
+  try {
+    const response = await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
+      method: 'POST',
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ planId })
+    });
+    if (!response.ok) {
+      throw new Error(`Erreur add plan : status ${response.status} - ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error('Erreur addMemberPlan : ', err.message);
+  }
+}
+async function removeMemberPlan(memberId, planId) {
+  try {
+    const response = await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
+      method: 'DELETE',
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+    });
+    if (!response.ok) {
+      throw new Error(`Erreur remove plan : status ${response.status} - ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error('Erreur removeMemberPlan : ', err.message);
+  }
+}
+async function updateMemberFields(memberId, programs) {
+  const updates = {};
+  const programToField = {
+    'athletyx': 'athletyx',
+    'booty': 'booty_shape',
+    'upper': 'upper_shape',
+    'flow': 'power_flow'
   };
-
-  // Idempotence côté Memberstack
-  async function addMemberPlan(memberId, planId) {
-    const r = await fetch(`https://admin.memberstack.com/members/${memberId}/add-plan`, {
-      method: 'POST',
-      headers: {
-        'X-API-KEY': process.env.MEMBERSTACK_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ planId })
-    });
-    if (r.ok) return;
-
-    const txt = await r.text();
-    try {
-      const data = JSON.parse(txt);
-      if (r.status === 400 && (data.code === 'already-have-plan' || /already have this plan/i.test(data.message))) {
-        console.log(`Plan already present for ${memberId} — treated as success`);
-        return; // ne pas throw
-      }
-    } catch (_) {}
-    throw new Error(`add plan ${r.status}: ${txt}`);
-  }
-
-  async function removeMemberPlan(memberId, planId) {
-    const r = await fetch(`https://admin.memberstack.com/members/${memberId}/remove-plan`, {
-      method: 'POST',
-      headers: {
-        'X-API-KEY': process.env.MEMBERSTACK_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ planId })
-    });
-    if (r.ok) return;
-
-    const txt = await r.text();
-    try {
-      const data = JSON.parse(txt);
-      if (r.status === 400 && (data.code === 'plan-not-found' || /do not have this plan/i.test(data.message))) {
-        console.log(`Plan already removed for ${memberId} — treated as success`);
-        return; // ne pas throw
-      }
-    } catch (_) {}
-    throw new Error(`remove plan ${r.status}: ${txt}`);
-  }
-
-  async function updateMemberFields(memberId, updates) {
-    const r = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+  programs.forEach(prog => {
+    const field = programToField[prog] || prog;
+    updates[field] = "1";
+  });
+  try {
+    const response = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
       method: 'PATCH',
-      headers: {
-        'X-API-KEY': process.env.MEMBERSTACK_API_KEY,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ customFields: updates })
     });
-    if (!r.ok) throw new Error(`update fields ${r.status}: ${await r.text()}`);
-  }
-
-  async function resetAllPrograms(memberId) {
-    return updateMemberFields(memberId, {
-      'athletyx': "0",
-      'booty-shape': "0",
-      'upper-shape': "0",
-      'power-flow': "0"
-    });
-  }
-
-  async function setStripeCustomerIdCF(memberId, stripeCustomerId) {
-    if (!stripeCustomerId) return;
-    // Le champ officiel Memberstack n'est pas éditable; on le stocke en custom field
-    await updateMemberFields(memberId, { 'stripe_customer_id': String(stripeCustomerId) });
-  }
-
-  // -------- Routing des événements --------
-  let selectedPrograms = [];
-  let memberId = null;
-  let stripeCustomerId = null;
-
-  try {
-    switch (event.type) {
-      case 'checkout.session.completed': {
-        // ✅ Seul endroit où l'on AJOUTE le plan — si et seulement si le paiement est PAID
-        const session = event.data.object;
-
-        // Sécurité : on ne traite que les sessions d'abonnement
-        if (session.mode !== 'subscription') break;
-
-        // On ne procède que si le paiement est confirmé
-        if (session.payment_status !== 'paid') {
-          console.log(`Skip add-plan: payment_status=${session.payment_status}`);
-          break;
-        }
-
-        selectedPrograms = parsePrograms(session.metadata);
-        memberId = session.metadata?.memberstack_id || null;
-        stripeCustomerId = typeof session.customer === 'string'
-          ? session.customer
-          : session.customer?.id || null;
-
-        if (!memberId) {
-          console.log('No memberId in session metadata — skipped');
-          break;
-        }
-
-        // Ajouter le plan + maj des champs
-        await addMemberPlan(memberId, GENERAL_PLAN_ID);
-        if (selectedPrograms.length) {
-          await updateMemberFields(memberId, updatesFrom(selectedPrograms));
-        }
-        await setStripeCustomerIdCF(memberId, stripeCustomerId);
-
-        console.log(`Plan added & fields updated for ${memberId} [${selectedPrograms.join(', ')}]`);
-        break;
-      }
-
-      case 'customer.subscription.updated': {
-        // ❌ ne pas ajouter de plan ici (risque de doublons)
-        const sub = event.data.object;
-        selectedPrograms = parsePrograms(sub.metadata);
-        memberId = sub.metadata?.memberstack_id || null;
-        stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || null;
-
-        if (!memberId) break;
-
-        if (selectedPrograms.length) {
-          await updateMemberFields(memberId, updatesFrom(selectedPrograms));
-        }
-        await setStripeCustomerIdCF(memberId, stripeCustomerId);
-        console.log(`Fields updated for ${memberId} [${selectedPrograms.join(', ')}]`);
-        break;
-      }
-
-      case 'invoice.paid': {
-        // Paiement récurrent réussi → MAJ des champs seulement (pas d'add plan)
-        const invoice = event.data.object;
-        if (!invoice.subscription) break;
-
-        const sub = await stripe.subscriptions.retrieve(invoice.subscription);
-        selectedPrograms = parsePrograms(sub.metadata);
-        memberId = sub.metadata?.memberstack_id || null;
-        stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || null;
-
-        if (!memberId) break;
-
-        if (selectedPrograms.length) {
-          await updateMemberFields(memberId, updatesFrom(selectedPrograms));
-        }
-        await setStripeCustomerIdCF(memberId, stripeCustomerId);
-        console.log(`Fields updated (invoice.paid) for ${memberId} [${selectedPrograms.join(', ')}]`);
-        break;
-      }
-
-      case 'invoice.payment_failed': {
-        // Paiement échoué → retirer le plan + reset
-        const inv = event.data.object;
-        let sub = null;
-
-        if (inv.subscription) {
-          sub = await stripe.subscriptions.retrieve(inv.subscription);
-          memberId = sub.metadata?.memberstack_id || null;
-          stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || null;
-        }
-
-        if (!memberId) {
-          // dernier recours : customer depuis invoice
-          stripeCustomerId = typeof inv.customer === 'string' ? inv.customer : inv.customer?.id || null;
-          // pas de memberId fiable → on ne touche pas
-          console.log('payment_failed without memberId — skipped remove-plan');
-          break;
-        }
-
-        await removeMemberPlan(memberId, GENERAL_PLAN_ID);
-        await resetAllPrograms(memberId);
-        await setStripeCustomerIdCF(memberId, stripeCustomerId);
-        console.log(`Plan removed & fields reset for ${memberId} (payment_failed)`);
-        break;
-      }
-
-      case 'customer.subscription.deleted': {
-        // Abonnement résilié → retirer le plan + reset
-        const sub = event.data.object;
-        memberId = sub.metadata?.memberstack_id || null;
-        stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id || null;
-
-        if (!memberId) {
-          console.log('subscription.deleted without memberId — skipped');
-          break;
-        }
-
-        await removeMemberPlan(memberId, GENERAL_PLAN_ID);
-        await resetAllPrograms(memberId);
-        await setStripeCustomerIdCF(memberId, stripeCustomerId);
-        console.log(`Plan removed & fields reset for ${memberId} (subscription.deleted)`);
-        break;
-      }
-
-      default:
-        // on ignore le reste
-        break;
+    if (!response.ok) {
+      throw new Error(`Erreur update fields : status ${response.status} - ${await response.text()}`);
     }
-
-    return res.send(); // toujours 200 si on arrive ici
   } catch (err) {
-    console.error(`Webhook processing error for ${memberId || 'unknown'}:`, err.message);
-    return res.status(500).send('Webhook handler error');
+    console.error('Erreur updateMemberFields : ', err.message);
   }
-};
+}
+async function resetMemberFields(memberId) {
+  const updates = {
+    'athletyx': "0",
+    'booty_shape': "0",
+    'upper_shape': "0",
+    'power_flow': "0"
+  };
+  try {
+    const response = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+      method: 'PATCH',
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customFields: updates })
+    });
+    if (!response.ok) {
+      throw new Error(`Erreur reset fields : status ${response.status} - ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error('Erreur resetMemberFields : ', err.message);
+  }
+}
