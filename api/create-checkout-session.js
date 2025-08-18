@@ -13,7 +13,7 @@ module.exports = async (req, res) => {
     console.log('Email from front: ' + email);
     try {
       let customer;
-      const customers = await stripe.customers.search({ query: `email:"${email}"` }); // Ligne corrigée
+      const customers = await stripe.customers.search({ query: `email:"${email}"` });
       if (customers.data.length > 0) {
         customer = customers.data[0];
         if (customer.email !== email) {
@@ -31,6 +31,7 @@ module.exports = async (req, res) => {
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
         metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId },
+        subscription_data: { metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId } }, // Propagation à subscription
         customer: customer.id
       });
       res.status(200).json({ id: session.id });
