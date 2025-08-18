@@ -32,7 +32,7 @@ module.exports = async (req, res) => {
       break;
     case 'customer.subscription.updated':
       const sub = event.data.object;
-      selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
       memberIdFromMetadata = sub.metadata.memberstack_id;
       console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
       const subId = invoice.subscription;
       if (subId) {
         const sub = await stripe.subscriptions.retrieve(subId);
-        selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+        selectedPrograms = sub.items.data.map(item => item.plan.metadata.type_programme || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
         memberIdFromMetadata = sub.metadata.memberstack_id;
         console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
@@ -66,83 +66,59 @@ module.exports = async (req, res) => {
   let memberId = memberIdFromMetadata; // Priorise ID from metadata
   if (!memberId) {
     memberId = await getMemberIdByEmail(customerEmail); // Fallback email if no ID
-    console.log('Fallback to email', customerEmail, 'found ID', memberId);
   }
   console.log('Member ID used: ' + memberId);
-  if (!memberId) {
-    console.log('Skipping: No ID or email');
-    res.send();
-    return;
-  }
-  const programToField = {
-    'athletyx': 'athletyx',
-    'booty': 'booty_shape',
-    'upper': 'upper_shape',
-    'flow': 'power_flow'
-  };
-  try {
+  if (memberId) {
+    const programToField = {
+      'athletyx': 'athletyx',
+      'booty': 'booty_shape',
+      'upper': 'upper_shape',
+      'flow': 'power_flow'
+    };
     if (isDelete || isFailure) {
       await removeMemberPlan(memberId, GENERAL_PLAN_ID);
       await resetMemberFields(memberId);
       console.log('Plan removed and fields reset for member ' + memberId);
     } else if (selectedPrograms.length > 0) {
       await addMemberPlan(memberId, GENERAL_PLAN_ID);
-      await updateMemberFields(memberId, selectedPrograms, programToField);
+      await updateMemberFields(memberId, selectedPrograms, programToField); // Mapping ajouté
       console.log('Plan added and fields updated for member ' + memberId + ' with programs ' + selectedPrograms);
     }
-  } catch (err) {
-    console.error('Erreur update Memberstack:', err);
+  } else {
+    console.log('No member found for email ' + customerEmail + ' or metadata ID');
   }
   res.send();
 };
 async function getMemberIdByEmail(email) {
-  try {
-    const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
-    });
-    const data = await res.json();
-    return data.data[0]?.id;
-  } catch (err) {
-    console.error('Erreur getMemberIdByEmail:', err);
-    return null;
-  }
+  const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
+  const data = await res.json();
+  return data.data[0]?.id;
 }
 async function addMemberPlan(memberId, planId) {
-  try {
-    await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
-      method: 'POST',
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ planId })
-    });
-  } catch (err) {
-    console.error('Erreur addMemberPlan:', err);
-  }
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
+    method: 'POST',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId })
+  });
 }
 async function removeMemberPlan(memberId, planId) {
-  try {
-    await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
-      method: 'DELETE',
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
-    });
-  } catch (err) {
-    console.error('Erreur removeMemberPlan:', err);
-  }
+  await fetch(`https://admin.memberstack.com/members/${memberId}/plans/${planId}`, {
+    method: 'DELETE',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+  });
 }
 async function updateMemberFields(memberId, programs, programToField) {
   const updates = {};
   programs.forEach(prog => {
-    const field = programToField[prog] || prog; // Mapping
-    updates[field] = "1";
+    updates[programToField[prog]] = "1"; // Utilise mapping pour noms exacts
   });
-  try {
-    await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-      method: 'PATCH',
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customFields: updates })
-    });
-  } catch (err) {
-    console.error('Erreur updateMemberFields:', err);
-  }
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
+  });
 }
 async function resetMemberFields(memberId) {
   const updates = {
@@ -151,13 +127,9 @@ async function resetMemberFields(memberId) {
     'upper_shape': "0",
     'power_flow': "0"
   };
-  try {
-    await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-      method: 'PATCH',
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customFields: updates })
-    });
-  } catch (err) {
-    console.error('Erreur resetMemberFields:', err);
-  }
+  await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+    method: 'PATCH',
+    headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customFields: updates })
+  });
 }
