@@ -32,7 +32,7 @@ module.exports = async (req, res) => {
       break;
     case 'customer.subscription.updated':
       const sub = event.data.object;
-      selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+      selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.replace(' ', '-').toLowerCase() : null)).filter(prog => prog !== null);
       customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
       memberIdFromMetadata = sub.metadata.memberstack_id;
       console.log('Updated: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
       const subId = invoice.subscription;
       if (subId) {
         const sub = await stripe.subscriptions.retrieve(subId);
-        selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.toLowerCase() : null)).filter(prog => prog !== null);
+        selectedPrograms = sub.items.data.map(item => item.plan.metadata.data_program || (item.plan.nickname ? item.plan.nickname.replace(' ', '-').toLowerCase() : null)).filter(prog => prog !== null);
         customerEmail = (await stripe.customers.retrieve(sub.customer)).email;
         memberIdFromMetadata = sub.metadata.memberstack_id;
         console.log('Paid: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
@@ -98,9 +98,10 @@ async function getMemberIdByEmail(email) {
     const data = await res.json();
     console.log('Recherche Member par email ' + email + ' : ' + data.data.length + ' résultats trouvés');
     if (data.data.length > 1) {
-      console.warn('Warning: Multiple members for email ' + email + ', taking the last (newest) one');
+      console.error('Error: Multiple members for email ' + email + ', returning null to avoid wrong ID');
+      return null; // Return null if multiple, to skip wrong update
     }
-    return data.data[data.data.length - 1]?.id || null; // Prend le dernier
+    return data.data[0]?.id || null;
   } catch (err) {
     console.error('Erreur getMemberIdByEmail : ', err.message);
     return null;
