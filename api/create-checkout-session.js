@@ -8,7 +8,7 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // email maintenant requis
+    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body;
     console.log('Member ID from front: ' + memberId);
     console.log('Email from front: ' + email);
     try {
@@ -34,8 +34,7 @@ module.exports = async (req, res) => {
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
         metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId },
-        customer: customer.id,
-        customer_email: email // Force email
+        customer: customer.id
       });
       res.status(200).json({ id: session.id });
     } catch (error) {
