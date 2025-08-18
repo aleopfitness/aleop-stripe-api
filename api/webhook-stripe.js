@@ -22,13 +22,15 @@ module.exports = async (req, res) => {
   let memberIdFromMetadata;
   let isDelete = false;
   let isFailure = false;
+  let stripeCustomerId;
   switch (event.type) {
     case 'checkout.session.completed':
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
       memberIdFromMetadata = session.metadata.memberstack_id;
-      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
+      stripeCustomerId = session.customer; // ID customer Stripe
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata, 'Stripe Customer ID', stripeCustomerId);
       break;
     case 'customer.subscription.updated':
       const sub = event.data.object;
@@ -65,9 +67,8 @@ module.exports = async (req, res) => {
   }
   let memberId = memberIdFromMetadata;
   if (!memberId) {
-    console.log('Metadata memberId missing for ' + event.type + ', skipping fallback and update to avoid wrong ID');
-    res.send();
-    return;
+    memberId = await getMemberIdByEmail(customerEmail);
+    console.log('Fallback email utilisé pour ' + customerEmail + ', ID trouvé : ' + memberId);
   }
   console.log('Member ID used: ' + memberId);
   if (memberId) {
@@ -83,6 +84,11 @@ module.exports = async (req, res) => {
       } else {
         console.log('Skipped update for ' + event.type + ' as programs empty');
       }
+      // Update stripeCustomerId toujours si présent et event completed
+      if (event.type === 'checkout.session.completed' && stripeCustomerId) {
+        await updateStripeCustomerId(memberId, stripeCustomerId);
+        console.log('Stripe Customer ID updated for member ' + memberId + ' to ' + stripeCustomerId);
+      }
     } catch (err) {
       console.error('Erreur lors de l\'update Memberstack pour member ' + memberId + ' : ', err.message);
     }
@@ -91,6 +97,22 @@ module.exports = async (req, res) => {
   }
   res.send();
 };
+async function getMemberIdByEmail(email) {
+  try {
+    const res = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
+    });
+    const data = await res.json();
+    console.log('Recherche Member par email ' + email + ' : ' + data.data.length + ' résultats trouvés');
+    if (data.data.length > 1) {
+      console.warn('Warning: Multiple members for email ' + email + ', taking the last (newest) one');
+    }
+    return data.data[data.data.length - 1]?.id || null;
+  } catch (err) {
+    console.error('Erreur getMemberIdByEmail : ', err.message);
+    return null;
+  }
+}
 async function addMemberPlan(memberId, planId) {
   try {
     const response = await fetch(`https://admin.memberstack.com/members/${memberId}/plans`, {
@@ -161,5 +183,19 @@ async function resetMemberFields(memberId) {
     }
   } catch (err) {
     console.error('Erreur resetMemberFields : ', err.message);
+  }
+}
+async function updateStripeCustomerId(memberId, stripeCustomerId) {
+  try {
+    const response = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
+      method: 'PATCH',
+      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stripeCustomerId })
+    });
+    if (!response.ok) {
+      throw new Error(`Erreur update stripeCustomerId : ${response.status} - ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error('Erreur updateStripeCustomerId : ', err.message);
   }
 }
