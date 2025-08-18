@@ -22,15 +22,13 @@ module.exports = async (req, res) => {
   let memberIdFromMetadata;
   let isDelete = false;
   let isFailure = false;
-  let stripeCustomerId;
   switch (event.type) {
     case 'checkout.session.completed':
       const session = event.data.object;
       selectedPrograms = session.metadata.selected_programs ? session.metadata.selected_programs.split(',') : [];
       customerEmail = session.customer_details.email;
       memberIdFromMetadata = session.metadata.memberstack_id;
-      stripeCustomerId = session.customer; // ID customer Stripe
-      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata, 'Stripe Customer ID', stripeCustomerId);
+      console.log('Completed: Programs', selectedPrograms, 'Email', customerEmail, 'Member ID from metadata', memberIdFromMetadata);
       break;
     case 'customer.subscription.updated':
       const sub = event.data.object;
@@ -84,11 +82,6 @@ module.exports = async (req, res) => {
       } else {
         console.log('Skipped update for ' + event.type + ' as programs empty');
       }
-      // Update stripeCustomerId toujours si présent et event completed
-      if (event.type === 'checkout.session.completed' && stripeCustomerId) {
-        await updateStripeCustomerId(memberId, stripeCustomerId);
-        console.log('Stripe Customer ID updated for member ' + memberId + ' to ' + stripeCustomerId);
-      }
     } catch (err) {
       console.error('Erreur lors de l\'update Memberstack pour member ' + memberId + ' : ', err.message);
     }
@@ -121,7 +114,7 @@ async function addMemberPlan(memberId, planId) {
       body: JSON.stringify({ planId })
     });
     if (!response.ok) {
-      throw new Error(`Erreur add plan : ${response.status} - ${await response.text()}`);
+      throw new Error(`Erreur add plan : status ${response.status} - ${await response.text()}`);
     }
   } catch (err) {
     console.error('Erreur addMemberPlan : ', err.message);
@@ -134,7 +127,7 @@ async function removeMemberPlan(memberId, planId) {
       headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY }
     });
     if (!response.ok) {
-      throw new Error(`Erreur remove plan : ${response.status} - ${await response.text()}`);
+      throw new Error(`Erreur remove plan : status ${response.status} - ${await response.text()}`);
     }
   } catch (err) {
     console.error('Erreur removeMemberPlan : ', err.message);
@@ -159,7 +152,7 @@ async function updateMemberFields(memberId, programs) {
       body: JSON.stringify({ customFields: updates })
     });
     if (!response.ok) {
-      throw new Error(`Erreur update fields : ${response.status} - ${await response.text()}`);
+      throw new Error(`Erreur update fields : status ${response.status} - ${await response.text()}`);
     }
   } catch (err) {
     console.error('Erreur updateMemberFields : ', err.message);
@@ -179,23 +172,9 @@ async function resetMemberFields(memberId) {
       body: JSON.stringify({ customFields: updates })
     });
     if (!response.ok) {
-      throw new Error(`Erreur reset fields : ${response.status} - ${await response.text()}`);
+      throw new Error(`Erreur reset fields : status ${response.status} - ${await response.text()}`);
     }
   } catch (err) {
     console.error('Erreur resetMemberFields : ', err.message);
-  }
-}
-async function updateStripeCustomerId(memberId, stripeCustomerId) {
-  try {
-    const response = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
-      method: 'PATCH',
-      headers: { 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stripeCustomerId })
-    });
-    if (!response.ok) {
-      throw new Error(`Erreur update stripeCustomerId : ${response.status} - ${await response.text()}`);
-    }
-  } catch (err) {
-    console.error('Erreur updateStripeCustomerId : ', err.message);
   }
 }
