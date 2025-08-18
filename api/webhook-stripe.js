@@ -3,7 +3,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
 // ✅ Ton plan (FREE) Memberstack
-const GENERAL_PLAN_ID = 'pln_general-access-7wge0qe1';
+const GENERAL_PLAN_ID = 'pln_aleop-access-tdig0eq7';
 
 module.exports = async (req, res) => {
   // Lire le RAW body (important pour vérifier la signature Stripe)
