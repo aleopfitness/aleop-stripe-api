@@ -8,13 +8,11 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body;
+    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // Ajout email
     console.log('Member ID from front: ' + memberId);
     console.log('Email from front: ' + email);
+    console.log('Line items reçus :', lineItems); // Log pour debug erreur Stripe
     try {
-      if (!email) {
-        throw new Error('Email manquant');
-      }
       let customer;
       const customers = await stripe.customers.search({ query: `email:"${email}"` });
       if (customers.data.length > 0) {
@@ -38,7 +36,7 @@ module.exports = async (req, res) => {
       });
       res.status(200).json({ id: session.id });
     } catch (error) {
-      console.error('Erreur création session:', error);
+      console.error('Erreur création session :', error.message);
       res.status(500).json({ error: error.message });
     }
   } else {
