@@ -1,5 +1,4 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -9,9 +8,13 @@ module.exports = async (req, res) => {
     return;
   }
   if (req.method === 'POST') {
-    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // Ajout memberId from front
-    console.log('Member ID from front: ' + memberId); // Log for debug
+    const { lineItems, coupon, selectedPrograms, email, memberId } = req.body; // email maintenant requis
+    console.log('Member ID from front: ' + memberId);
+    console.log('Email from front: ' + email);
     try {
+      if (!email) {
+        throw new Error('Email manquant');
+      }
       let customer;
       const customers = await stripe.customers.search({ query: `email:"${email}"` });
       if (customers.data.length > 0) {
@@ -23,7 +26,6 @@ module.exports = async (req, res) => {
       } else {
         customer = await stripe.customers.create({ email });
       }
-
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         payment_method_types: ['card'],
@@ -31,12 +33,13 @@ module.exports = async (req, res) => {
         discounts: coupon ? [{ coupon }] : [],
         success_url: 'https://aleopplatform.webflow.io/success?session_id={CHECKOUT_SESSION_ID}',
         cancel_url: 'https://aleopplatform.webflow.io/cancel',
-        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId }, // Ajout memberId in metadata
+        metadata: { selected_programs: selectedPrograms.join(','), memberstack_id: memberId },
         customer: customer.id,
-        customer_email: email
+        customer_email: email // Force email
       });
       res.status(200).json({ id: session.id });
     } catch (error) {
+      console.error('Erreur création session:', error);
       res.status(500).json({ error: error.message });
     }
   } else {
