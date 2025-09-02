@@ -1,4 +1,7 @@
 // /api/ms-webhook.js
+// Webhook Memberstack (Svix) multi-env : accepte Test & Live, choisit la bonne API key,
+// et met à jour UNIQUEMENT tes champs underscore : Athletyx, Booty_Shape, Upper_Shape, Power_Flow.
+
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
 
@@ -16,7 +19,7 @@ async function kvGet(key){
   const d = await kvJson(res);
   return d?.result ? JSON.parse(d.result) : null;
 }
-// ✅ CORRIGÉ: Vercel KV utilise /set/{key}?ex=TTL avec body JSON {value}
+// ✅ Vercel KV: /set/{key}?ex=TTL  + body JSON { value }
 async function kvSetEx(key, value, ttl){
   const url = `${kvBase()}/set/${encodeURIComponent(key)}?ex=${ttl}`;
   const res = await fetch(url, {
@@ -24,7 +27,7 @@ async function kvSetEx(key, value, ttl){
     headers:{ ...kvHeaders(), 'Content-Type':'application/json' },
     body: JSON.stringify({ value: JSON.stringify(value) })
   });
-  await kvJson(res); // tolérant (OK / JSON)
+  await kvJson(res);
 }
 
 /* ===== Memberstack Admin (clé selon env) ===== */
@@ -81,6 +84,7 @@ function verifyWithEitherSecret(raw, headers){
 
 /* ===== Handler ===== */
 module.exports = async (req, res) => {
+  // lire le body brut
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
 
   let env, evt;
@@ -108,7 +112,7 @@ module.exports = async (req, res) => {
       console.log('Missing IDs', { env, haveMemberId:!!memberId, havePlanId:!!planId, preview: JSON.stringify(payload).slice(0,900) });
       return res.send();
     }
-    // Ignore les exemples (IDs bidons très courts)
+    // Ignore les exemples (IDs très courts/bidons)
     if(memberId.length < 10 || planId.length < 10){
       console.log('Example webhook detected, skip update', { env, memberId, planId });
       return res.send();
@@ -120,6 +124,7 @@ module.exports = async (req, res) => {
       const intent = await kvGet(`intent:${ptr.intentId}`);
       if(intent && intent.status !== 'applied'){
         const selected = new Set((intent.programs || []).map(s=>String(s).toLowerCase()));
+
         // 2) Updates underscore only
         const updates = {};
         ALL_FIELDS.forEach(fieldKey=>{
@@ -132,7 +137,7 @@ module.exports = async (req, res) => {
         // 3) Marquer applied (NON-BLOQUANT)
         try {
           await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
-        } catch(e){ console.warn('KV setex failed (non-blocking):', e.message); }
+        } catch(e){ console.warn('KV set failed (non-blocking):', e.message); }
 
         console.log(`Applied (${env}) ${memberId}: updates=${JSON.stringify(updates)}`);
         return res.send();
