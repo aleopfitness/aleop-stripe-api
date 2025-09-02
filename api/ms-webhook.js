@@ -5,12 +5,26 @@
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
 
-// ----- KV helpers -----
+/* ========================= KV helpers (Upstash / Vercel KV) ========================= */
+
 function kvBase()  { return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
 function kvToken() { return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
-function kvHeaders(){ const t = kvToken(); if (!t) throw new Error('KV token missing'); return { Authorization: `Bearer ${t}` }; }
-async function kvJson(res){ if(!res.ok) throw new Error(`KV ${res.status}: ${await res.text()}`); return res.json(); }
-async function kvGet(key){ const res = await fetch(`${kvBase()}/get/${encodeURIComponent(key)}`, { headers: kvHeaders() }); const d = await kvJson(res); return d?.result ? JSON.parse(d.result) : null; }
+function kvHeaders(){
+  const t = kvToken();
+  if (!t) throw new Error('KV token missing');
+  return { Authorization: `Bearer ${t}` };
+}
+// >>> Parser tolérant: JSON ou texte brut ("OK")
+async function kvJson(res){
+  const text = await res.text();
+  if (!res.ok) throw new Error(`KV ${res.status}: ${text}`);
+  try { return JSON.parse(text); } catch { return { result: text }; }
+}
+async function kvGet(key){
+  const res = await fetch(`${kvBase()}/get/${encodeURIComponent(key)}`, { headers: kvHeaders() });
+  const d = await kvJson(res);
+  return d?.result ? JSON.parse(d.result) : null;
+}
 async function kvSetEx(key, value, ttl){
   const res = await fetch(`${kvBase()}/setex/${encodeURIComponent(key)}/${ttl}`, {
     method:'POST',
@@ -20,11 +34,13 @@ async function kvSetEx(key, value, ttl){
   await kvJson(res);
 }
 
-// ----- Memberstack Admin (choix de la clé par env) -----
+/* ========================= Memberstack Admin (clé selon env) ========================= */
+
 async function msUpdateFields(env, memberId, updates){
   const apiKey =
     env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE :
-    env === 'test' ? process.env.MEMBERSTACK_API_KEY_TEST : null;
+    env === 'test' ? process.env.MEMBERSTACK_API_KEY_TEST :
+    process.env.MEMBERSTACK_API_KEY; // fallback éventuel
 
   if (!apiKey) throw new Error(`Missing Memberstack API key for env=${env}`);
 
@@ -36,7 +52,8 @@ async function msUpdateFields(env, memberId, updates){
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-// ----- mapping slug -> champs UNDERSCORE -----
+/* ========================= Mapping programmes ========================= */
+
 const SLUG_TO_FIELD = {
   'athletyx':    'Athletyx',
   'booty-shape': 'Booty_Shape',
@@ -45,22 +62,41 @@ const SLUG_TO_FIELD = {
 };
 const ALL_FIELDS = ['Athletyx','Booty_Shape','Upper_Shape','Power_Flow'];
 
-// utils
-function get(obj, path){ return path.split('.').reduce((o,k)=>o && o[k]!==undefined ? o[k] : undefined, obj); }
+/* ========================= Utils ========================= */
+
+function get(obj, path){
+  return path.split('.').reduce((o,k)=>o && o[k]!==undefined ? o[k] : undefined, obj);
+}
 function findByKeys(obj, keys){
-  let out; (function walk(o){ if(out) return; if(o && typeof o==='object'){ for(const [k,v] of Object.entries(o)){ if(out) break;
-    if(keys.includes(k) && typeof v==='string' && v){ out=v; break; }
-    if(v && typeof v==='object') walk(v);
-  }}})(obj); return out;
+  let out;
+  (function walk(o){
+    if (out) return;
+    if (o && typeof o === 'object') {
+      for (const [k,v] of Object.entries(o)) {
+        if (out) break;
+        if (keys.includes(k) && typeof v === 'string' && v) { out = v; break; }
+        if (v && typeof v === 'object') walk(v);
+      }
+    }
+  })(obj);
+  return out;
 }
 function findByPattern(obj, regex){
-  let out; (function walk(o){ if(out) return; if(o && typeof o==='object'){ for(const v of Object.values(o)){ if(out) break;
-    if(typeof v==='string' && regex.test(v)){ out=v; break; }
-    if(v && typeof v==='object') walk(v);
-  }}})(obj); return out;
+  let out;
+  (function walk(o){
+    if (out) return;
+    if (o && typeof o === 'object') {
+      for (const v of Object.values(o)) {
+        if (out) break;
+        if (typeof v === 'string' && regex.test(v)) { out = v; break; }
+        if (v && typeof v === 'object') walk(v);
+      }
+    }
+  })(obj);
+  return out;
 }
 
-// Vérifie la signature avec LIVE puis TEST. Retourne {env, event} si OK.
+// Vérifie avec LIVE puis TEST (ou MS_WEBHOOK_SECRET unique). Retourne {env, event}
 function verifyWithEitherSecret(rawBody, headers){
   const id  = headers['svix-id'];
   const ts  = headers['svix-timestamp'];
@@ -74,18 +110,19 @@ function verifyWithEitherSecret(rawBody, headers){
 
   const live = process.env.MS_WEBHOOK_SECRET_LIVE;
   const test = process.env.MS_WEBHOOK_SECRET_TEST;
+  const single = process.env.MS_WEBHOOK_SECRET;
 
-  if (live) {
-    try { return { env:'live', event: tryVerify(live) }; } catch(_) {}
-  }
-  if (test) {
-    try { return { env:'test', event: tryVerify(test) }; } catch(_) {}
-  }
-  throw new Error('Invalid signature for both LIVE and TEST secrets');
+  if (live) { try { return { env:'live', event: tryVerify(live) }; } catch(_) {} }
+  if (test) { try { return { env:'test', event: tryVerify(test) }; } catch(_) {} }
+  if (single){ try { return { env:'live', event: tryVerify(single) }; } catch(_) {} } // fallback
+
+  throw new Error('Invalid signature for provided secrets');
 }
 
+/* ========================= Handler ========================= */
+
 module.exports = async (req, res) => {
-  // Lire le body brut (requis)
+  // body brut requis par Svix
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
 
   let env, evt;
@@ -123,7 +160,7 @@ module.exports = async (req, res) => {
       return res.send();
     }
 
-    // Ignorer les "example webhooks" (IDs bidons)
+    // Ignorer les exemples (IDs bidons)
     if (memberId.length < 10 || planId.length < 10) {
       console.log('Example webhook detected, skip update', { env, memberId, planId });
       return res.send();
@@ -140,17 +177,28 @@ module.exports = async (req, res) => {
         const updates = {};
         ALL_FIELDS.forEach(fieldKey => {
           const slug = Object.keys(SLUG_TO_FIELD).find(k => SLUG_TO_FIELD[k] === fieldKey);
-          updates[fieldKey] = selectedSlugs.has(slug) ? "1" : "0";
+        updates[fieldKey] = selectedSlugs.has(slug) ? "1" : "0";
         });
 
         await msUpdateFields(env, memberId, updates);
-        await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
+
+        // 3) Marquer l'intent comme "applied" (NON-BLOQUANT)
+        try {
+          await kvSetEx(
+            `intent:${intent.intentId}`,
+            { ...intent, status:'applied', appliedAt: Date.now() },
+            7*24*60*60
+          );
+        } catch (e) {
+          console.warn('KV setex failed (non-blocking):', e.message);
+        }
+
         console.log(`Applied (${env}) ${memberId}: updates=${JSON.stringify(updates)}`);
         return res.send();
       }
     }
 
-    // 3) Fallback : pas d’intent → tout à "0"
+    // 4) Fallback : pas d’intent → tout à "0"
     const updates = {}; ALL_FIELDS.forEach(f => { updates[f] = "0"; });
     await msUpdateFields(env, memberId, updates);
     console.log(`Applied fallback (${env}) ${memberId}: all programs=0`);
