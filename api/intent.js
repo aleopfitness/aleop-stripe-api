@@ -30,15 +30,19 @@ module.exports = async (req, res) => {
 
   try {
     const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || '{}');
-    const { memberId, programs = [], seats = 0, priceId, createdAt } = JSON.parse(raw || '{}');
+    const { env, memberId, email, programs = [], seats = 0, priceId, createdAt } = JSON.parse(raw || '{}');
+
+    if (env !== 'test' && env !== 'live') return res.status(400).json({ ok:false, error:'env must be test|live' });
     if (!memberId || !Array.isArray(programs)) return res.status(400).json({ ok:false, error:'memberId + programs required' });
+    const emailKey = (email || '').trim().toLowerCase();
 
     const intentId = `i_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
-    const intent = { intentId, memberId, programs, seats, priceId, createdAt: createdAt || new Date().toISOString(), status:'pending' };
+    const intent = { intentId, env, memberId, email: emailKey, programs, seats, priceId, createdAt: createdAt || new Date().toISOString(), status:'pending' };
 
-    // stocke l’intent (7 jours) + un pointeur par membre
+    // stocke l’intent (7 jours) + pointeurs par memberId et par email
     await kvSetEx(`intent:${intentId}`, intent, 7*24*60*60);
-    await kvSetEx(`latest-intent:${memberId}`, { intentId, t: Date.now() }, 7*24*60*60);
+    await kvSetEx(`latest-intent:${memberId}`, { intentId, env, t: Date.now() }, 7*24*60*60);
+    if (emailKey) await kvSetEx(`latest-intent-email:${emailKey}`, { intentId, env, t: Date.now() }, 7*24*60*60);
 
     res.status(200).json({ ok:true, intentId });
   } catch (e) {
