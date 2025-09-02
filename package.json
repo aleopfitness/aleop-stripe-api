@@ -2,9 +2,8 @@
   "name": "aleop-stripe-api",
   "version": "1.0.0",
   "dependencies": {
+    "node-fetch": "^2.6.1",
     "stripe": "^14.0.0",
-    "node-fetch": "^2.6.1"
     "svix": "^1.16.0"
-
   }
 }
