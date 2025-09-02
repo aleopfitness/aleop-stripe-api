@@ -1,4 +1,7 @@
 // /api/ms-webhook.js
+// Webhook Memberstack (Svix) multi-env : accepte Test & Live, choisit la bonne API key,
+// et met à jour UNIQUEMENT tes champs underscore : Athletyx, Booty_Shape, Upper_Shape, Power_Flow.
+
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
 
@@ -17,11 +20,17 @@ async function kvSetEx(key, value, ttl){
   await kvJson(res);
 }
 
-// ----- Memberstack Admin -----
-async function msUpdateFields(memberId, updates){
+// ----- Memberstack Admin (choix de la clé par env) -----
+async function msUpdateFields(env, memberId, updates){
+  const apiKey =
+    env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE :
+    env === 'test' ? process.env.MEMBERSTACK_API_KEY_TEST : null;
+
+  if (!apiKey) throw new Error(`Missing Memberstack API key for env=${env}`);
+
   const r = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
     method:'PATCH',
-    headers:{ 'X-API-KEY': process.env.MEMBERSTACK_API_KEY, 'Content-Type':'application/json' },
+    headers:{ 'X-API-KEY': apiKey, 'Content-Type':'application/json' },
     body: JSON.stringify({ customFields: updates })
   });
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
@@ -51,30 +60,48 @@ function findByPattern(obj, regex){
   }}})(obj); return out;
 }
 
+// Vérifie la signature avec LIVE puis TEST. Retourne {env, event} si OK.
+function verifyWithEitherSecret(rawBody, headers){
+  const id  = headers['svix-id'];
+  const ts  = headers['svix-timestamp'];
+  const sig = headers['svix-signature'];
+  if(!id || !ts || !sig) throw new Error('Missing Svix headers');
+
+  const tryVerify = (secret) => {
+    const wh = new Webhook(secret);
+    return wh.verify(rawBody, { 'svix-id': id, 'svix-timestamp': ts, 'svix-signature': sig });
+  };
+
+  const live = process.env.MS_WEBHOOK_SECRET_LIVE;
+  const test = process.env.MS_WEBHOOK_SECRET_TEST;
+
+  if (live) {
+    try { return { env:'live', event: tryVerify(live) }; } catch(_) {}
+  }
+  if (test) {
+    try { return { env:'test', event: tryVerify(test) }; } catch(_) {}
+  }
+  throw new Error('Invalid signature for both LIVE and TEST secrets');
+}
+
 module.exports = async (req, res) => {
+  // Lire le body brut (requis)
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
 
-  const id  = req.headers['svix-id'];
-  const ts  = req.headers['svix-timestamp'];
-  const sig = req.headers['svix-signature'];
-  if(!id || !ts || !sig) return res.status(400).send('Missing Svix headers');
-  if(!process.env.MS_WEBHOOK_SECRET) { console.error('MS_WEBHOOK_SECRET missing'); return res.status(500).send('Server misconfigured'); }
-
-  let evt;
+  let env, evt;
   try {
-    const wh = new Webhook(process.env.MS_WEBHOOK_SECRET);
-    evt = wh.verify(body, { 'svix-id': id, 'svix-timestamp': ts, 'svix-signature': sig });
+    const v = verifyWithEitherSecret(body, req.headers);
+    env = v.env; evt = v.event;
   } catch (e) {
-    console.error('Invalid Svix signature:', e.message);
+    console.error('Signature error:', e.message);
     return res.status(400).send('Invalid signature');
   }
 
   const type    = evt?.type || evt?.event;
   const payload = evt?.data || evt?.payload || {};
-  // ---- LOG GLOBAL : on loggue toute requête reçue
-  try { console.log('MS webhook hit:', { type, keys: Object.keys(payload||{}) }); } catch(_) {}
+  try { console.log('MS webhook hit:', { env, type }); } catch(_) {}
 
-  if (type !== 'member.plan.added') { return res.send(); }
+  if (type !== 'member.plan.added') return res.send();
 
   try {
     // IDs robustes (incl. payload.planConnection.planId pour les tests)
@@ -92,13 +119,13 @@ module.exports = async (req, res) => {
       findByPattern(payload, /^pln_[A-Za-z0-9-]+$/);
 
     if(!memberId || !planId) {
-      console.log('Missing IDs', { haveMemberId: !!memberId, havePlanId: !!planId, preview: JSON.stringify(payload).slice(0, 900) });
+      console.log('Missing IDs', { env, haveMemberId: !!memberId, havePlanId: !!planId, preview: JSON.stringify(payload).slice(0, 900) });
       return res.send();
     }
 
-    // Ignorer les exemples (IDs trop courts)
+    // Ignorer les "example webhooks" (IDs bidons)
     if (memberId.length < 10 || planId.length < 10) {
-      console.log('Example webhook detected, skip update', { memberId, planId });
+      console.log('Example webhook detected, skip update', { env, memberId, planId });
       return res.send();
     }
 
@@ -116,17 +143,17 @@ module.exports = async (req, res) => {
           updates[fieldKey] = selectedSlugs.has(slug) ? "1" : "0";
         });
 
-        await msUpdateFields(memberId, updates);
+        await msUpdateFields(env, memberId, updates);
         await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
-        console.log(`Applied ${memberId}: updates=${JSON.stringify(updates)}`);
+        console.log(`Applied (${env}) ${memberId}: updates=${JSON.stringify(updates)}`);
         return res.send();
       }
     }
 
     // 3) Fallback : pas d’intent → tout à "0"
     const updates = {}; ALL_FIELDS.forEach(f => { updates[f] = "0"; });
-    await msUpdateFields(memberId, updates);
-    console.log(`Applied fallback ${memberId}: all programs=0`);
+    await msUpdateFields(env, memberId, updates);
+    console.log(`Applied fallback (${env}) ${memberId}: all programs=0`);
     return res.send();
 
   } catch (err) {
