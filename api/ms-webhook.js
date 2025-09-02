@@ -1,11 +1,8 @@
 // /api/ms-webhook.js
-// Webhook Memberstack (Svix) multi-env : accepte Test & Live, choisit la bonne API key,
-// et met à jour UNIQUEMENT tes champs underscore : Athletyx, Booty_Shape, Upper_Shape, Power_Flow.
-
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
 
-/* ===== KV (Vercel KV / Upstash) ===== */
+/* ===== KV ===== */
 function kvBase(){ return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
 function kvToken(){ return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
 function kvHeaders(){ const t = kvToken(); if(!t) throw new Error('KV token missing'); return { Authorization:`Bearer ${t}` }; }
@@ -19,7 +16,6 @@ async function kvGet(key){
   const d = await kvJson(res);
   return d?.result ? JSON.parse(d.result) : null;
 }
-// ✅ Vercel KV: /set/{key}?ex=TTL  + body JSON { value }
 async function kvSetEx(key, value, ttl){
   const url = `${kvBase()}/set/${encodeURIComponent(key)}?ex=${ttl}`;
   const res = await fetch(url, {
@@ -30,12 +26,12 @@ async function kvSetEx(key, value, ttl){
   await kvJson(res);
 }
 
-/* ===== Memberstack Admin (clé selon env) ===== */
+/* ===== Memberstack Admin ===== */
 async function msUpdateFields(env, memberId, updates){
   const apiKey =
     env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE :
     env === 'test' ? process.env.MEMBERSTACK_API_KEY_TEST :
-    process.env.MEMBERSTACK_API_KEY; // fallback si tu gardes une seule clé
+    process.env.MEMBERSTACK_API_KEY;
   if(!apiKey) throw new Error(`Missing Memberstack API key for env=${env}`);
 
   const r = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
@@ -46,14 +42,16 @@ async function msUpdateFields(env, memberId, updates){
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-/* ===== Mapping programmes (underscore only) ===== */
-const SLUG_TO_FIELD = {
+/* ===== Mapping programmes ===== */
+// slugs "kebab" qu’on reçoit du front via intent.programs
+const KEBA B_FIELDS = ['athletyx','booty-shape','upper-shape','power-flow'];
+// correspondances underscore (si jamais)
+const SLUG_TO_UNDERSCORE = {
   'athletyx':    'Athletyx',
   'booty-shape': 'Booty_Shape',
   'upper-shape': 'Upper_Shape',
   'power-flow':  'Power_Flow'
 };
-const ALL_FIELDS = ['Athletyx','Booty_Shape','Upper_Shape','Power_Flow'];
 
 /* ===== Utils ===== */
 function get(o, path){ return path.split('.').reduce((x,k)=>x&&x[k]!==undefined?x[k]:undefined,o); }
@@ -70,7 +68,7 @@ function findByPattern(obj, re){
   }}})(obj); return out;
 }
 
-/* ===== Vérif signature multi-env (LIVE puis TEST, puis single) ===== */
+/* ===== Signature Svix multi-env ===== */
 function verifyWithEitherSecret(raw, headers){
   const id=headers['svix-id'], ts=headers['svix-timestamp'], sig=headers['svix-signature'];
   if(!id || !ts || !sig) throw new Error('Missing Svix headers');
@@ -98,56 +96,60 @@ module.exports = async (req, res) => {
   if(type !== 'member.plan.added') return res.send();
 
   try {
-    // IDs robustes (+ format test planConnection.planId)
+    // IDs + email
     let memberId =
       get(payload,'member.id') || payload.memberId ||
       findByKeys(payload,['memberId','member_id']) ||
       findByPattern(payload,/^mem_[A-Za-z0-9]+$/);
-    let planId =
-      get(payload,'plan.id') || payload.planId || get(payload,'planConnection.planId') ||
-      findByKeys(payload,['planId','plan_id']) ||
-      findByPattern(payload,/^pln_[A-Za-z0-9-]+$/);
 
-    if(!memberId || !planId){
-      console.log('Missing IDs', { env, haveMemberId:!!memberId, havePlanId:!!planId, preview: JSON.stringify(payload).slice(0,900) });
-      return res.send();
-    }
-    // Ignore les exemples (IDs très courts/bidons)
-    if(memberId.length < 10 || planId.length < 10){
-      console.log('Example webhook detected, skip update', { env, memberId, planId });
+    const emailRaw =
+      get(payload,'member.email') || payload.email ||
+      findByKeys(payload,['email','member_email']);
+    const emailKey = (emailRaw || '').trim().toLowerCase();
+
+    if(!memberId && !emailKey){
+      console.log('Missing IDs & email', { env, preview: JSON.stringify(payload).slice(0,900) });
       return res.send();
     }
 
-    // 1) Lire l’intent KV
-    const ptr = await kvGet(`latest-intent:${memberId}`);
+    // 1) On cherche l’intent d’abord par memberId (idempotent), sinon par email
+    let ptr = memberId ? await kvGet(`latest-intent:${memberId}`) : null;
+    if(!ptr && emailKey) ptr = await kvGet(`latest-intent-email:${emailKey}`);
+
     if(ptr?.intentId){
       const intent = await kvGet(`intent:${ptr.intentId}`);
+
+      // garde d'env : si l’intent est taggé et ne correspond pas à l’env du webhook, on skippe
+      if (intent?.env && intent.env !== env) {
+        console.log(`ENV mismatch: intent=${intent.env} webhook=${env} member=${memberId||'n/a'} email=${emailKey||'n/a'} → skip`);
+        return res.send();
+      }
+
       if(intent && intent.status !== 'applied'){
         const selected = new Set((intent.programs || []).map(s=>String(s).toLowerCase()));
 
-        // 2) Updates underscore only
+        // updates sur les 2 familles de clés : kebab (confirmé) + underscore (au cas où)
         const updates = {};
-        ALL_FIELDS.forEach(fieldKey=>{
-          const slug = Object.keys(SLUG_TO_FIELD).find(k=>SLUG_TO_FIELD[k]===fieldKey);
-          updates[fieldKey] = selected.has(slug) ? "1" : "0";
+        // kebab
+        KEBA B_FIELDS.forEach(k => { updates[k] = selected.has(k) ? "1" : "0"; });
+        // underscore
+        Object.entries(SLUG_TO_UNDERSCORE).forEach(([slug, unders]) => {
+          updates[unders] = selected.has(slug) ? "1" : "0";
         });
 
-        await msUpdateFields(env, memberId, updates);
+        await msUpdateFields(env, (memberId || intent.memberId), updates);
 
-        // 3) Marquer applied (NON-BLOQUANT)
         try {
           await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
         } catch(e){ console.warn('KV set failed (non-blocking):', e.message); }
 
-        console.log(`Applied (${env}) ${memberId}: updates=${JSON.stringify(updates)}`);
+        console.log(`Applied (${env}) ${(memberId||intent.memberId)}: updates=${JSON.stringify(updates)} via ${ptr.intentId}`);
         return res.send();
       }
     }
 
-    // 4) Fallback : pas d’intent → tout à "0"
-    const updates = {}; ALL_FIELDS.forEach(f=>{ updates[f]="0"; });
-    await msUpdateFields(env, memberId, updates);
-    console.log(`Applied fallback (${env}) ${memberId}: all programs=0`);
+    // 2) Pas d’intent → ne rien écraser; log clair
+    console.log(`No intent found for member=${memberId||'n/a'} email=${emailKey||'n/a'} (env=${env}) → skip (no-op)`);
     return res.send();
 
   } catch (err) {
