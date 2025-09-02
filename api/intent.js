@@ -29,20 +29,47 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
 
   try {
-    const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || '{}');
-    const { env, memberId, email, programs = [], seats = 0, priceId, createdAt } = JSON.parse(raw || '{}');
+    const body = typeof req.body === 'object' && req.body !== null
+      ? req.body
+      : JSON.parse(typeof req.body === 'string' ? req.body : '{}');
 
-    if (env !== 'test' && env !== 'live') return res.status(400).json({ ok:false, error:'env must be test|live' });
-    if (!memberId || !Array.isArray(programs)) return res.status(400).json({ ok:false, error:'memberId + programs required' });
-    const emailKey = (email || '').trim().toLowerCase();
+    const {
+      env,                // devient optionnel
+      memberId,
+      email,              // devient optionnel
+      programs = [],
+      seats = 0,
+      priceId,
+      createdAt
+    } = body || {};
+
+    if (!memberId || !Array.isArray(programs)) {
+      return res.status(400).json({ ok:false, error:'memberId + programs required' });
+    }
+
+    // Normalisations optionnelles
+    const envIn = (env === 'test' || env === 'live') ? env : undefined; // facultatif
+    const emailKey = (email || '').trim().toLowerCase() || undefined;
 
     const intentId = `i_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
-    const intent = { intentId, env, memberId, email: emailKey, programs, seats, priceId, createdAt: createdAt || new Date().toISOString(), status:'pending' };
+    const intent = {
+      intentId,
+      env: envIn,                 // peut être undefined
+      memberId,
+      email: emailKey,            // peut être undefined
+      programs,
+      seats,
+      priceId,
+      createdAt: createdAt || new Date().toISOString(),
+      status:'pending'
+    };
 
-    // stocke l’intent (7 jours) + pointeurs par memberId et par email
+    // Stockage (7 jours)
     await kvSetEx(`intent:${intentId}`, intent, 7*24*60*60);
-    await kvSetEx(`latest-intent:${memberId}`, { intentId, env, t: Date.now() }, 7*24*60*60);
-    if (emailKey) await kvSetEx(`latest-intent-email:${emailKey}`, { intentId, env, t: Date.now() }, 7*24*60*60);
+    await kvSetEx(`latest-intent:${memberId}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
+    if (emailKey) {
+      await kvSetEx(`latest-intent-email:${emailKey}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
+    }
 
     res.status(200).json({ ok:true, intentId });
   } catch (e) {
