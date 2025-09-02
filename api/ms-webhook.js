@@ -1,7 +1,7 @@
 // /api/ms-webhook.js
 // Webhook Memberstack (Svix) : applique les accès après ajout d'un paid plan.
 // Écrit UNIQUEMENT tes champs custom underscore : Athletyx, Booty_Shape, Upper_Shape, Power_Flow
-// -> "1" si acheté, "0" sinon (via l'intent stocké côté serveur).
+// - Extraction robuste des IDs (memberId / planId), y compris fallback par pattern.
 
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
@@ -24,7 +24,7 @@ async function msUpdateFields(memberId, updates){
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-// ---------- TES planId -> seats (pas utilisé pour écrire des champs mais utile à garder)
+// ---------- TES plans -> seats (informative) ----------
 const PLAN_TO_SEATS = {
   'pln_aleop-1-license-7x1ng0yup': 1,
   'pln_aleop-2-licenses-671nh0yv8': 2,
@@ -46,8 +46,41 @@ const SLUG_TO_FIELD = {
 };
 const ALL_FIELDS = ['Athletyx','Booty_Shape','Upper_Shape','Power_Flow'];
 
-// util
-function get(obj, path){ return path.split('.').reduce((o,k)=>o&&o[k]!==undefined?o[k]:undefined,obj); }
+// ---------- utils: safe-get + recherche fallback ----------
+function get(obj, path){
+  return path.split('.').reduce((o,k)=>o && o[k]!==undefined ? o[k] : undefined, obj);
+}
+
+// Retourne la 1ère valeur string d'une clé parmi candidates (deep)
+function findByKeys(obj, candidates){
+  let found;
+  (function walk(o){
+    if (found) return;
+    if (o && typeof o === 'object') {
+      for (const [k,v] of Object.entries(o)) {
+        if (found) break;
+        if (candidates.includes(k) && typeof v === 'string' && v) { found = v; break; }
+        if (typeof v === 'object' && v) walk(v);
+      }
+    }
+  })(obj);
+  return found;
+}
+// Retourne la 1ère string qui matche un pattern (deep)
+function findByPattern(obj, regex){
+  let found;
+  (function walk(o){
+    if (found) return;
+    if (o && typeof o === 'object') {
+      for (const v of Object.values(o)) {
+        if (found) break;
+        if (typeof v === 'string' && regex.test(v)) { found = v; break; }
+        if (typeof v === 'object' && v) walk(v);
+      }
+    }
+  })(obj);
+  return found;
+}
 
 module.exports = async (req, res) => {
   // lire le body brut (obligatoire pour Svix)
@@ -74,14 +107,35 @@ module.exports = async (req, res) => {
 
   if (type === 'member.plan.added') {
     try {
-      const memberId = get(data,'member.id') || get(data,'id') || get(data,'memberId');
-      const planId   = get(data,'plan.id')   || get(data,'planId') || get(data,'newPlan.id');
-      if(!memberId || !planId) { console.log('Missing IDs'); return res.send(); }
+      // 1) Extraction robuste des IDs
+      let memberId =
+        get(data,'member.id') ||
+        get(data,'memberId') ||
+        get(data,'member') ||
+        findByKeys(data, ['memberId','member_id']) ||
+        findByPattern(data, /^mem_[a-zA-Z0-9]+$/);
 
-      // (facultatif) on garde la détection de seats via planId pour logs/cohérence
+      let planId =
+        get(data,'plan.id') ||
+        get(data,'planId') ||
+        get(data,'newPlan.id') ||
+        get(data,'plan') ||
+        findByKeys(data, ['planId','plan_id']) ||
+        findByPattern(data, /^pln_[a-zA-Z0-9-]+$/);
+
+      if(!memberId || !planId) {
+        console.log('Missing IDs', {
+          type,
+          haveMemberId: !!memberId,
+          havePlanId: !!planId,
+          sample: JSON.stringify(data, null, 2).slice(0, 1500) // snippet utile sans flood
+        });
+        return res.send(); // 200 → évite les retries en boucle sur tests
+      }
+
       const seats = PLAN_TO_SEATS[planId] || null;
 
-      // retrouver l'intent (programmes choisis côté panier)
+      // 2) Retrouver l'intent KV (programmes choisis)
       const ptr = await kvGet(`latest-intent:${memberId}`);
       if (ptr?.intentId) {
         const intent = await kvGet(`intent:${ptr.intentId}`);
@@ -97,15 +151,16 @@ module.exports = async (req, res) => {
 
           await msUpdateFields(memberId, updates);
           await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
-          console.log(`Applied ${memberId}: seats=${seats ?? 'n/a'}, updates=${JSON.stringify(updates)}`);
+
+          console.log(`Applied ${memberId}: plan=${planId} seats=${seats ?? 'n/a'} updates=${JSON.stringify(updates)}`);
           return res.send();
         }
       }
 
-      // fallback : pas d’intent -> on met toutes les licences à "0"
+      // 3) Fallback : pas d’intent -> on met toutes les licences à "0"
       const updates = {}; ALL_FIELDS.forEach(f => { updates[f] = "0"; });
       await msUpdateFields(memberId, updates);
-      console.log(`Applied fallback ${memberId}: seats=${seats ?? 'n/a'}, all programs=0`);
+      console.log(`Applied fallback ${memberId}: plan=${planId} seats=${seats ?? 'n/a'} all programs=0`);
       return res.send();
 
     } catch(err) {
