@@ -1,11 +1,8 @@
 // /api/ms-webhook.js
-// Applique les accès après ajout d'un paid plan (Memberstack → Svix).
-// Met à jour UNIQUEMENT tes 4 champs underscore: Athletyx, Booty_Shape, Upper_Shape, Power_Flow.
-
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
 
-// ---------- KV helpers (Upstash / Vercel KV) ----------
+// ----- KV helpers -----
 function kvBase()  { return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
 function kvToken() { return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
 function kvHeaders(){ const t = kvToken(); if (!t) throw new Error('KV token missing'); return { Authorization: `Bearer ${t}` }; }
@@ -20,7 +17,7 @@ async function kvSetEx(key, value, ttl){
   await kvJson(res);
 }
 
-// ---------- Memberstack Admin API ----------
+// ----- Memberstack Admin -----
 async function msUpdateFields(memberId, updates){
   const r = await fetch(`https://admin.memberstack.com/members/${memberId}`, {
     method:'PATCH',
@@ -30,7 +27,7 @@ async function msUpdateFields(memberId, updates){
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-// ---------- mapping slug panier -> champ underscore ----------
+// ----- mapping slug -> champs UNDERSCORE -----
 const SLUG_TO_FIELD = {
   'athletyx':    'Athletyx',
   'booty-shape': 'Booty_Shape',
@@ -39,41 +36,22 @@ const SLUG_TO_FIELD = {
 };
 const ALL_FIELDS = ['Athletyx','Booty_Shape','Upper_Shape','Power_Flow'];
 
-// ---------- utils ----------
-function get(obj, path){
-  return path.split('.').reduce((o,k)=>o && o[k]!==undefined ? o[k] : undefined, obj);
-}
+// utils
+function get(obj, path){ return path.split('.').reduce((o,k)=>o && o[k]!==undefined ? o[k] : undefined, obj); }
 function findByKeys(obj, keys){
-  let out;
-  (function walk(o){
-    if (out) return;
-    if (o && typeof o === 'object') {
-      for (const [k,v] of Object.entries(o)) {
-        if (out) break;
-        if (keys.includes(k) && typeof v === 'string' && v) { out = v; break; }
-        if (typeof v === 'object') walk(v);
-      }
-    }
-  })(obj);
-  return out;
+  let out; (function walk(o){ if(out) return; if(o && typeof o==='object'){ for(const [k,v] of Object.entries(o)){ if(out) break;
+    if(keys.includes(k) && typeof v==='string' && v){ out=v; break; }
+    if(v && typeof v==='object') walk(v);
+  }}})(obj); return out;
 }
 function findByPattern(obj, regex){
-  let out;
-  (function walk(o){
-    if (out) return;
-    if (o && typeof o === 'object') {
-      for (const v of Object.values(o)) {
-        if (out) break;
-        if (typeof v === 'string' && regex.test(v)) { out = v; break; }
-        if (typeof v === 'object') walk(v);
-      }
-    }
-  })(obj);
-  return out;
+  let out; (function walk(o){ if(out) return; if(o && typeof o==='object'){ for(const v of Object.values(o)){ if(out) break;
+    if(typeof v==='string' && regex.test(v)){ out=v; break; }
+    if(v && typeof v==='object') walk(v);
+  }}})(obj); return out;
 }
 
 module.exports = async (req, res) => {
-  // Lire le body brut (requis par Svix)
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
 
   const id  = req.headers['svix-id'];
@@ -82,7 +60,6 @@ module.exports = async (req, res) => {
   if(!id || !ts || !sig) return res.status(400).send('Missing Svix headers');
   if(!process.env.MS_WEBHOOK_SECRET) { console.error('MS_WEBHOOK_SECRET missing'); return res.status(500).send('Server misconfigured'); }
 
-  // Vérif signature
   let evt;
   try {
     const wh = new Webhook(process.env.MS_WEBHOOK_SECRET);
@@ -94,17 +71,19 @@ module.exports = async (req, res) => {
 
   const type    = evt?.type || evt?.event;
   const payload = evt?.data || evt?.payload || {};
-  if (type !== 'member.plan.added') return res.send();
+  // ---- LOG GLOBAL : on loggue toute requête reçue
+  try { console.log('MS webhook hit:', { type, keys: Object.keys(payload||{}) }); } catch(_) {}
+
+  if (type !== 'member.plan.added') { return res.send(); }
 
   try {
-    // 1) Récupérer memberId / planId pour tous les formats connus (incl. test)
+    // IDs robustes (incl. payload.planConnection.planId pour les tests)
     let memberId =
       get(payload,'member.id') ||
       payload.memberId ||
       findByKeys(payload, ['memberId','member_id']) ||
       findByPattern(payload, /^mem_[A-Za-z0-9]+$/);
 
-    // NB: test Memberstack → payload.planConnection.planId
     let planId =
       get(payload,'plan.id') ||
       payload.planId ||
@@ -113,29 +92,24 @@ module.exports = async (req, res) => {
       findByPattern(payload, /^pln_[A-Za-z0-9-]+$/);
 
     if(!memberId || !planId) {
-      console.log('Missing IDs', {
-        haveMemberId: !!memberId,
-        havePlanId: !!planId,
-        preview: JSON.stringify(payload).slice(0, 900)
-      });
-      return res.send(); // 200: on évite les retries en boucle
+      console.log('Missing IDs', { haveMemberId: !!memberId, havePlanId: !!planId, preview: JSON.stringify(payload).slice(0, 900) });
+      return res.send();
     }
 
-    // Astuce: les webhooks **exemples** ont des IDs faux (ex: mem_abc / Lorem…)
-    // On ne tente pas d'update dans ce cas pour éviter un 404 inutile.
+    // Ignorer les exemples (IDs trop courts)
     if (memberId.length < 10 || planId.length < 10) {
       console.log('Example webhook detected, skip update', { memberId, planId });
       return res.send();
     }
 
-    // 2) Lire l’intent KV déposé par le front
+    // 1) Lire l’intent KV
     const ptr = await kvGet(`latest-intent:${memberId}`);
     if (ptr?.intentId) {
       const intent = await kvGet(`intent:${ptr.intentId}`);
       if (intent && intent.status !== 'applied') {
         const selectedSlugs = new Set((intent.programs || []).map(s => String(s).toLowerCase()));
 
-        // Construire updates: uniquement champs underscore
+        // 2) Construire updates underscore only
         const updates = {};
         ALL_FIELDS.forEach(fieldKey => {
           const slug = Object.keys(SLUG_TO_FIELD).find(k => SLUG_TO_FIELD[k] === fieldKey);
@@ -149,7 +123,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 3) Fallback: pas d’intent → tout à "0" (sécurisé)
+    // 3) Fallback : pas d’intent → tout à "0"
     const updates = {}; ALL_FIELDS.forEach(f => { updates[f] = "0"; });
     await msUpdateFields(memberId, updates);
     console.log(`Applied fallback ${memberId}: all programs=0`);
