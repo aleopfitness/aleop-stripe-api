@@ -1,6 +1,5 @@
 // /api/ms-webhook.js
-// Version simple : vérif Svix (test/live), retrouve l'intent (par memberId puis email),
-// puis PATCH exactement ces 4 champs Memberstack : Athletyx, Booty_Shape, Upper_Shape, Power_Flow.
+// Webhook Memberstack (Svix) — MAJ des 4 custom fields par ID exact (kebab-case)
 
 const { Webhook } = require('svix');
 const fetch = require('node-fetch');
@@ -48,14 +47,8 @@ async function msPatchMember(env, memberId, customFields){
   if(!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-/* ===== Slugs panier -> clés Memberstack (FIXES) ===== */
-const SLUG_TO_FIELD = {
-  'athletyx':    'Athletyx',
-  'booty-shape': 'Booty_Shape',
-  'upper-shape': 'Upper_Shape',
-  'power-flow':  'Power_Flow'
-};
-const ALL_FIELDS = Object.values(SLUG_TO_FIELD);
+/* ===== IDs EXACTS des champs ===== */
+const FIELD_IDS = ['athletyx','booty-shape','upper-shape','power-flow'];
 
 /* ===== Utils ===== */
 function get(o, path){ return path.split('.').reduce((x,k)=>x&&x[k]!==undefined?x[k]:undefined,o); }
@@ -68,7 +61,7 @@ function findByKeys(obj, keys){
   }})(obj); return out;
 }
 
-/* ===== Vérif signature Svix multi-env ===== */
+/* ===== Vérif signature Svix (test OU live) ===== */
 function verifyWithEitherSecret(raw, headers){
   const id=headers['svix-id'], ts=headers['svix-timestamp'], sig=headers['svix-signature'];
   if(!id || !ts || !sig) throw new Error('Missing Svix headers');
@@ -82,7 +75,7 @@ function verifyWithEitherSecret(raw, headers){
 
 /* ===== Handler ===== */
 module.exports = async (req, res) => {
-  // corps brut requis pour Svix
+  // lire le corps brut (requis pour Svix)
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
 
   let env, evt;
@@ -110,28 +103,28 @@ module.exports = async (req, res) => {
       return res.send();
     }
 
-    // retrouver l’intent : d’abord par memberId, sinon par email
+    // 1) Retrouver l’intent : d’abord par memberId, sinon par email
     let ptr = memberId ? await kvGet(`latest-intent:${memberId}`) : null;
     if(!ptr && emailKey) ptr = await kvGet(`latest-intent-email:${emailKey}`);
     if(!ptr?.intentId){
       console.log(`No intent for member=${memberId||'n/a'} email=${emailKey||'n/a'} → skip`);
       return res.send();
     }
+
     const intent = await kvGet(`intent:${ptr.intentId}`);
     if(!intent || intent.status === 'applied'){ console.log('Intent unusable → skip'); return res.send(); }
     if (intent.env && intent.env !== env) { console.log(`ENV mismatch intent=${intent.env} webhook=${env} → skip`); return res.send(); }
 
-    // construire updates fixes : tout à "0", puis "1" pour les slugs sélectionnés
-    const selected = new Set((intent.programs || []).map(s=>String(s).toLowerCase()));
+    // 2) Construire updates avec les IDs EXACTS
+    const selected = new Set((intent.programs || []).map(s => String(s).toLowerCase()));
     const updates = {};
-    ALL_FIELDS.forEach(k => updates[k] = "0");
-    Object.entries(SLUG_TO_FIELD).forEach(([slug, field]) => {
-      if (selected.has(slug)) updates[field] = "1";
-    });
+    FIELD_IDS.forEach(id => { updates[id] = "0"; });
+    FIELD_IDS.forEach(id => { if (selected.has(id)) updates[id] = "1"; });
 
+    // 3) PATCH
     await msPatchMember(env, memberId || intent.memberId, updates);
 
-    // marquer applied (non bloquant)
+    // 4) Marquer l’intent applied (non bloquant)
     try {
       await kvSetEx(`intent:${intent.intentId}`, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
     } catch(e){ console.warn('KV set failed (non-blocking):', e.message); }
