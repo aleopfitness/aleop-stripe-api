@@ -1,24 +1,5 @@
 // /api/intent.js
-const fetch = require('node-fetch');
-
-/* ===== KV (Vercel KV / Upstash) ===== */
-function kvBase(){ return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
-function kvToken(){ return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
-function kvHeaders(){ const t = kvToken(); if(!t) throw new Error('KV token missing'); return { Authorization:`Bearer ${t}` }; }
-async function kvJson(res){
-  const text = await res.text();
-  if(!res.ok) throw new Error(`KV ${res.status}: ${text}`);
-  try { return JSON.parse(text); } catch { return { result: text }; }
-}
-async function kvSetEx(key, value, ttl){
-  const url = `${kvBase()}/set/${encodeURIComponent(key)}?ex=${ttl}`;
-  const res = await fetch(url, {
-    method:'POST',
-    headers:{ ...kvHeaders(), 'Content-Type':'application/json' },
-    body: JSON.stringify({ value: JSON.stringify(value) })
-  });
-  await kvJson(res);
-}
+const { kvSetEx, kvGet } = require('./kv.js');
 
 module.exports = async (req, res) => {
   // CORS simple
@@ -34,46 +15,47 @@ module.exports = async (req, res) => {
       : JSON.parse(typeof req.body === 'string' ? req.body : '{}');
 
     const {
-      env,                // devient optionnel
+      env,          // 'test'|'live' (front la met déjà)
       memberId,
-      email,              // devient optionnel
-      programs = [],
+      email,
+      programs = [],  // ex: ['booty','upper']
       seats = 0,
       priceId,
       createdAt
     } = body || {};
 
-    // Validation
     if (!memberId || !Array.isArray(programs) || programs.length === 0) {
-      console.log('Intent validation fail:', { memberId, programs });
-      return res.status(400).json({ ok:false, error:'memberId + non-empty programs array required' });
+      return res.status(400).json({ ok:false, error:'memberId + non-empty programs required' });
     }
 
-    // Normalisations optionnelles
-    const envIn = (env === 'test' || env === 'live') ? env : undefined; // facultatif
+    const envIn = (env === 'test' || env === 'live') ? env : 'test';
     const emailKey = (email || '').trim().toLowerCase() || undefined;
 
     const intentId = `i_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
     const intent = {
       intentId,
-      env: envIn,                 // peut être undefined
+      env: envIn,
       memberId,
-      email: emailKey,            // peut être undefined
-      programs, // IDs MS directs
+      email: emailKey,
+      programs,
       seats,
       priceId,
       createdAt: createdAt || new Date().toISOString(),
       status:'pending'
     };
 
-    console.log('Intent stored:', { intentId, memberId, emailKey, env: envIn, programs });
-
-    // Stockage (7 jours) - env-specific pour latest
+    // 1) Écrire intent + pointeurs
     await kvSetEx(`intent:${intentId}`, intent, 7*24*60*60);
-    const envPrefix = envIn || 'default';
-    await kvSetEx(`latest-intent:${envPrefix}:${memberId}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
+    await kvSetEx(`latest-intent:${envIn}:${memberId}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
     if (emailKey) {
-      await kvSetEx(`latest-intent-email:${envPrefix}:${emailKey}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
+      await kvSetEx(`latest-intent-email:${envIn}:${emailKey}`, { intentId, env: envIn, t: Date.now() }, 7*24*60*60);
+    }
+
+    // 2) Read-back (anti latence région)
+    for (let i = 0; i < 3; i++) {
+      const check = await kvGet(`intent:${intentId}`);
+      if (check) break;
+      await new Promise(r => setTimeout(r, 200 * (i + 1))); // 200, 400, 600ms
     }
 
     res.status(200).json({ ok:true, intentId });
