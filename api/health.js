@@ -1,5 +1,5 @@
 // /api/health.js
-const { kvGet } = require('./kv.js');
+const { kvGet, unwrapKVResult } = require('./kv.js');
 
 module.exports = async (req, res) => {
   try {
@@ -16,38 +16,31 @@ module.exports = async (req, res) => {
     const mirror = env === 'live' ? 'test' : 'live';
 
     const tried = [];
-    function add(k){ tried.push(k); return kvGet(k); }
+    async function getK(k){ tried.push(k); const v = await kvGet(k); return unwrapKVResult(v) || v; }
 
-    const result = { ok:true, env, email, memberId, tried: [] };
+    const out = { ok:true, env, email, memberId, tried: [] };
+    let ptrEmail = null, ptrMember = null, intent = null;
 
-    // read email pointers
-    let ptrEmail = null;
     if (email) {
-      ptrEmail = await add(`latest-intent-email:${env}:${email}`)
-              || await add(`latest-intent-email:${mirror}:${email}`)
-              || await add(`latest-intent-email:default:${email}`);
-      result.ptrEmail = ptrEmail || null;
+      ptrEmail = await getK(`latest-intent-email:${env}:${email}`)
+              || await getK(`latest-intent-email:${mirror}:${email}`)
+              || await getK(`latest-intent-email:default:${email}`);
     }
-
-    // read memberId pointers
-    let ptrMember = null;
     if (memberId) {
-      ptrMember = await add(`latest-intent:${env}:${memberId}`)
-               || await add(`latest-intent:${mirror}:${memberId}`)
-               || await add(`latest-intent:default:${memberId}`);
-      result.ptrMember = ptrMember || null;
+      ptrMember = await getK(`latest-intent:${env}:${memberId}`)
+               || await getK(`latest-intent:${mirror}:${memberId}`)
+               || await getK(`latest-intent:default:${memberId}`);
     }
 
-    // resolve intent
     const intentId = (ptrEmail && ptrEmail.intentId) || (ptrMember && ptrMember.intentId);
-    if (intentId) {
-      result.intent = await add(`intent:${intentId}`);
-    } else {
-      result.intent = null;
-    }
+    if (intentId) intent = await getK(`intent:${intentId}`);
 
-    result.tried = tried;
-    return res.status(200).json(result);
+    out.ptrEmail = ptrEmail || null;
+    out.ptrMember = ptrMember || null;
+    out.intent = intent || null;
+    out.tried = tried;
+
+    return res.status(200).json(out);
   } catch(e){
     return res.status(500).json({ ok:false, error:e.message });
   }
