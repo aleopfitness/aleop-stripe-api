@@ -2,7 +2,7 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
 
-/* ===== KV Utils ===== */
+/* ===== KV Utils (Avec Log Raw pour Debug) ===== */
 function kvBase() { return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
 function kvToken() { return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
 function kvHeaders() { 
@@ -13,7 +13,11 @@ function kvHeaders() {
 async function kvJson(res) {
   const text = await res.text();
   if (!res.ok) throw new Error(`KV ${res.status}: ${text}`);
-  try { return JSON.parse(text); } catch { return { result: text }; }
+  try { 
+    const parsed = JSON.parse(text);
+    console.log('KV raw response:', { status: res.status, text: text.slice(0, 200) }); // Log raw pour debug
+    return parsed; 
+  } catch { return { result: text }; }
 }
 async function kvGet(key) {
   const res = await fetch(`${kvBase()}/get/${encodeURIComponent(key)}`, { headers: kvHeaders() });
@@ -61,10 +65,8 @@ function verifyStripeSignature(rawBody, signature) {
 
 /* ===== Déduire Env (Via PriceId ou Secret) ===== */
 function getEnvFromEvent(event) {
-  // Option: Si secrets séparés en Vercel
   if (process.env.STRIPE_WEBHOOK_SECRET_TEST && process.env.STRIPE_WEBHOOK_SECRET === process.env.STRIPE_WEBHOOK_SECRET_TEST) return 'test';
-  // Via priceId (tes live sans 'test_')
-  const priceId = event.data.object.line_items?.data?.[0]?.price?.id || event.data.object.lines?.data?.[0]?.price?.id || ''; // Pour invoice
+  const priceId = event.data.object.line_items?.data?.[0]?.price?.id || event.data.object.lines?.data?.[0]?.price?.id || '';
   if (priceId.includes('test_') || priceId.includes('price_test_')) return 'test';
   return 'live';
 }
@@ -137,20 +139,32 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    const intent = await kvGet(`intent:${ptr.intentId}`);
-    if (!intent || intent.status === 'applied') {
-      console.log('Intent unusable → skip');
+    // 2) Fetch full intent avec retry + log raw
+    let intent;
+    for (let i = 0; i < 3; i++) {
+      intent = await kvGet(`intent:${ptr.intentId}`);
+      console.log(`Intent fetch attempt ${i+1}:`, { intentId: ptr.intentId, intent: intent ? { status: intent.status, env: intent.env, programs: intent.programs } : 'null' });
+      if (intent) break;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+    if (!intent) {
+      console.log('Intent fetch failed after retry → skip');
       return res.status(200).send();
     }
-    // Ignore env mismatch (fallback géré)
+
+    if (intent.status === 'applied') {
+      console.log('Intent applied → skip (clear KV if test)');
+      return res.status(200).send();
+    }
+
     console.log(`Intent found (from ${ptr.env || 'fallback'}):`, { intentId: ptr.intentId, programs: intent.programs });
 
-    // 2) Build updates avec tes 9 IDs
+    // 3) Build updates avec tes 9 IDs
     const selected = new Set((intent.programs || []).map(s => String(s).toLowerCase()));
     const updates = {};
     FIELD_IDS.forEach(id => { updates[id] = selected.has(id) ? "1" : "0"; });
 
-    // 3) Get memberId par query MS (safe fallback)
+    // 4) Get memberId par query MS (safe fallback)
     let memberId = session.metadata?.memberId;
     if (!memberId) {
       const key = msApiKey(env);
@@ -166,10 +180,10 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    // 4) PATCH MS
+    // 5) PATCH MS
     await msPatchMember(env, memberId, updates);
 
-    // 5) Mark applied
+    // 6) Mark applied
     try {
       await kvSetEx(`intent:${intent.intentId}`, { ...intent, status: 'applied', appliedAt: Date.now() }, 7 * 24 * 60 * 60);
     } catch (e) { console.warn('KV update failed:', e.message); }
