@@ -10,24 +10,14 @@ function h(){ return { Authorization:`Bearer ${token()}` }; }
 // Normalise n'importe quel format de retour KV vers l'objet stocké
 function unwrapKVResult(j){
   if (j == null) return null;
-  // Upstash & Vercel renvoient un objet { result: ... }
   const r = Object.prototype.hasOwnProperty.call(j, 'result') ? j.result : j;
-
-  // Cas 1: string JSON
-  if (typeof r === 'string') {
-    try { return JSON.parse(r); } catch { return r; }
-  }
-  // Cas 2: objet { value: "..." }
+  if (typeof r === 'string') { try { return JSON.parse(r); } catch { return r; } }
   if (r && typeof r === 'object' && Object.prototype.hasOwnProperty.call(r, 'value')) {
     const v = r.value;
-    if (typeof v === 'string') {
-      try { return JSON.parse(v); } catch { return v; }
-    }
+    if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } }
     return v ?? null;
   }
-  // Cas 3: objet déjà l'objet attendu
   if (r && typeof r === 'object') return r;
-
   return null;
 }
 
