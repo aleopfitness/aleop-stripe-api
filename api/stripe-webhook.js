@@ -5,14 +5,14 @@ const { kvGet, kvSetEx, unwrapKVResult } = require('./kv.js');
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
-/* Stripe (single secret) */
+/* ----- Stripe (single secret) ----- */
 function stripeClient(){
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) throw new Error('STRIPE_SECRET_KEY missing');
   return new Stripe(key);
 }
 function verifyWithSingleSecret(rawBody, sig){
-  const secret = process.env.STRIPE_WEBHOOK_SECRET; // TEST secret
+  const secret = process.env.STRIPE_WEBHOOK_SECRET; // secret webhook TEST (ou LIVE ensuite)
   if (!secret) throw new Error('STRIPE_WEBHOOK_SECRET missing');
   const s = stripeClient();
   const event = s.webhooks.constructEvent(rawBody, sig, secret);
@@ -20,7 +20,7 @@ function verifyWithSingleSecret(rawBody, sig){
   return { event, env };
 }
 
-/* Memberstack v2 */
+/* ----- Memberstack v2 ----- */
 function msApiKey(env){
   return env === 'live'
     ? process.env.MEMBERSTACK_API_KEY_LIVE
@@ -52,6 +52,7 @@ async function msPatchMember(env, memberId, customFields){
   console.log('[MS] PATCH OK', { status: r.status });
 }
 
+/* ----- Utils ----- */
 function buildFlags(programs){
   const set = new Set((programs||[]).map(s => String(s).toLowerCase()));
   const u = {}; FIELD_IDS.forEach(id => u[id] = set.has(id) ? "1" : "0"); return u;
@@ -61,23 +62,22 @@ function allZero(){ const u={}; FIELD_IDS.forEach(id=>u[id]="0"); return u; }
 async function getPtrByEmailOrMember(env, emailKey){
   const MIRROR = (env === 'live') ? 'test' : 'live';
 
-  // 1) email-based pointers
+  // email pointers
   if (emailKey) {
-    let ptr = await kvGet(`latest-intent-email:${env}:${emailKey}`);
-    if (!ptr) ptr = await kvGet(`latest-intent-email:${MIRROR}:${emailKey}`);
-    if (!ptr) ptr = await kvGet(`latest-intent-email:default:${emailKey}`);
-    // dé-emballe si jamais le store a renvoyé {value:"..."}
+    let ptr = await kvGet(`latest-intent-email:${env}:${emailKey}`)
+           || await kvGet(`latest-intent-email:${MIRROR}:${emailKey}`)
+           || await kvGet(`latest-intent-email:default:${emailKey}`);
     ptr = unwrapKVResult(ptr) || ptr;
     if (ptr && ptr.intentId) return { ptr, memberId: null };
   }
 
-  // 2) via Memberstack -> memberId pointers
+  // member pointers via MS lookup
   let memberId = null;
   if (emailKey) memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
   if (memberId) {
-    let ptr = await kvGet(`latest-intent:${env}:${memberId}`);
-    if (!ptr) ptr = await kvGet(`latest-intent:${MIRROR}:${memberId}`);
-    if (!ptr) ptr = await kvGet(`latest-intent:default:${memberId}`);
+    let ptr = await kvGet(`latest-intent:${env}:${memberId}`)
+           || await kvGet(`latest-intent:${MIRROR}:${memberId}`)
+           || await kvGet(`latest-intent:default:${memberId}`);
     ptr = unwrapKVResult(ptr) || ptr;
     if (ptr && ptr.intentId) return { ptr, memberId };
   }
@@ -91,6 +91,9 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Stripe-Signature');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
+
+  // ⚠️ si tu es en Next.js API Routes, ajoute en bas du fichier:
+  // export const config = { api: { bodyParser: false } };
 
   // raw body pour signature
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
@@ -111,7 +114,7 @@ module.exports = async (req, res) => {
     const emailKey = ((obj.customer_details && obj.customer_details.email) || obj.customer_email || '').trim().toLowerCase() || null;
     const stripeCustomerId = obj.customer || obj.customer_id || null;
 
-    // idempotence
+    // idempotence: on ne short-circuite que si déjà APPLIQUÉ précédemment
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) return res.status(200).send();
 
@@ -119,13 +122,13 @@ module.exports = async (req, res) => {
     if (type === 'checkout.session.completed' || type === 'invoice.paid'){
       const { ptr, memberId: memberFromLookup } = await getPtrByEmailOrMember(env, emailKey);
 
+      // ❌ Skip sans marquer processed (Stripe réessaiera)
       if (!ptr || !ptr.intentId){
         console.log(`[PTR] NOT FOUND for email=${emailKey || 'n/a'} (env/mirror/default checked)`);
-        await kvSetEx(evtKey, 1, 30*24*3600);
         return res.status(200).send();
       }
 
-      // fetch intent (avec mini retry)
+      // fetch intent (avec mini retry) + unwrap
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       for (let i=0;i<3;i++){
@@ -135,22 +138,25 @@ module.exports = async (req, res) => {
         if (intent) break;
         await new Promise(r=>setTimeout(r, 250*(i+1)));
       }
+
+      // ❌ Skip sans processed si manquant ou déjà applied
       if (!intent || intent.status === 'applied'){
         console.log('[INTENT] unusable -> skip');
-        await kvSetEx(evtKey, 1, 30*24*3600);
         return res.status(200).send();
       }
 
       let memberId = memberFromLookup || intent.memberId || (emailKey ? await msFindMemberIdByEmail(env, emailKey).catch(()=>null) : null);
+
+      // ❌ Skip sans processed si on ne résout pas le memberId (Stripe réessaie)
       if (!memberId){
         console.log('[MS] memberId not resolved -> skip');
-        await kvSetEx(evtKey, 1, 30*24*3600);
         return res.status(200).send();
       }
 
       const updates = buildFlags(intent.programs);
       await msPatchMember(env, memberId, updates);
 
+      // ✅ Succès: on marque processed et applied
       await kvSetEx(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*3600);
       await kvSetEx(evtKey, 1, 30*24*3600);
       if (stripeCustomerId) await kvSetEx(`map:scus:${env}:${stripeCustomerId}`, { memberId }, 30*24*3600);
@@ -159,7 +165,7 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    /* ===== Annulation -> tout à 0 ===== */
+    /* ===== Annulation -> tout à 0 (on peut marquer processed ici) ===== */
     if (type === 'customer.subscription.deleted'){
       let memberId = null;
       if (stripeCustomerId){
@@ -169,7 +175,7 @@ module.exports = async (req, res) => {
         console.log('[MAP] scus -> member', { env, stripeCustomerId, memberId: !!memberId });
       }
       if (!memberId && emailKey) memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
-      if (!memberId){ await kvSetEx(evtKey, 1, 30*24*3600); return res.status(200).send(); }
+      if (!memberId){ return res.status(200).send(); }
 
       await msPatchMember(env, memberId, allZero());
       await kvSetEx(evtKey, 1, 30*24*3600);
@@ -177,11 +183,15 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    await kvSetEx(evtKey, 1, 30*24*3600);
+    // autres types non gérés
     return res.status(200).send();
 
   }catch(err){
-    console.error('Stripe webhook error:', err.message);
+    console.error('Stripe webhook error:', err && err.message ? err.message : err);
+    if (err && err.stack) console.error(err.stack);
     return res.status(500).send('Handler error');
   }
 };
+
+// ⚠️ Si tu utilises Next.js API Routes : décommente cette ligne pour conserver le raw body
+// export const config = { api: { bodyParser: false } };
