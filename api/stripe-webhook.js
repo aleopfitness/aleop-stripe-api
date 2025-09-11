@@ -1,7 +1,7 @@
 // /api/stripe-webhook.js
 const fetch = require('node-fetch');
 const Stripe = require('stripe');
-const { kvGet, kvSetEx } = require('./kv.js');
+const { kvGet, kvSetEx, unwrapKVResult } = require('./kv.js');
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
@@ -58,11 +58,31 @@ function buildFlags(programs){
 }
 function allZero(){ const u={}; FIELD_IDS.forEach(id=>u[id]="0"); return u; }
 
-/* helper : log les clés essayées */
-async function tryGet(label, key){
-  const val = await kvGet(key);
-  console.log('[PTR]', label, key, val && val.intentId ? `HIT(${val.intentId})` : 'MISS');
-  return val;
+async function getPtrByEmailOrMember(env, emailKey){
+  const MIRROR = (env === 'live') ? 'test' : 'live';
+
+  // 1) email-based pointers
+  if (emailKey) {
+    let ptr = await kvGet(`latest-intent-email:${env}:${emailKey}`);
+    if (!ptr) ptr = await kvGet(`latest-intent-email:${MIRROR}:${emailKey}`);
+    if (!ptr) ptr = await kvGet(`latest-intent-email:default:${emailKey}`);
+    // dé-emballe si jamais le store a renvoyé {value:"..."}
+    ptr = unwrapKVResult(ptr) || ptr;
+    if (ptr && ptr.intentId) return { ptr, memberId: null };
+  }
+
+  // 2) via Memberstack -> memberId pointers
+  let memberId = null;
+  if (emailKey) memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
+  if (memberId) {
+    let ptr = await kvGet(`latest-intent:${env}:${memberId}`);
+    if (!ptr) ptr = await kvGet(`latest-intent:${MIRROR}:${memberId}`);
+    if (!ptr) ptr = await kvGet(`latest-intent:default:${memberId}`);
+    ptr = unwrapKVResult(ptr) || ptr;
+    if (ptr && ptr.intentId) return { ptr, memberId };
+  }
+
+  return { ptr: null, memberId: null };
 }
 
 module.exports = async (req, res) => {
@@ -72,6 +92,7 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
 
+  // raw body pour signature
   let body=''; req.setEncoding('utf8'); req.on('data',c=>body+=c); await new Promise(r=>req.on('end',r));
   const sig = req.headers['stripe-signature'];
 
@@ -90,40 +111,26 @@ module.exports = async (req, res) => {
     const emailKey = ((obj.customer_details && obj.customer_details.email) || obj.customer_email || '').trim().toLowerCase() || null;
     const stripeCustomerId = obj.customer || obj.customer_id || null;
 
+    // idempotence
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) return res.status(200).send();
 
     /* ===== Paiement (initial/renouvellement) ===== */
     if (type === 'checkout.session.completed' || type === 'invoice.paid'){
-      let ptr = null;
-      const MIRROR = (env === 'live') ? 'test' : 'live';
-
-      if (emailKey){
-        ptr = await tryGet('email@env',     `latest-intent-email:${env}:${emailKey}`) ||
-              await tryGet('email@mirror',  `latest-intent-email:${MIRROR}:${emailKey}`) ||
-              await tryGet('email@default', `latest-intent-email:default:${emailKey}`);
-      }
-
-      let memberId = null;
-      if (!ptr && emailKey){
-        memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
-        if (memberId){
-          ptr = await tryGet('member@env',     `latest-intent:${env}:${memberId}`) ||
-                await tryGet('member@mirror',  `latest-intent:${MIRROR}:${memberId}`) ||
-                await tryGet('member@default', `latest-intent:default:${memberId}`);
-        }
-      }
+      const { ptr, memberId: memberFromLookup } = await getPtrByEmailOrMember(env, emailKey);
 
       if (!ptr || !ptr.intentId){
-        console.log('[PTR] RESULT: NOT FOUND -> skip');
+        console.log(`[PTR] NOT FOUND for email=${emailKey || 'n/a'} (env/mirror/default checked)`);
         await kvSetEx(evtKey, 1, 30*24*3600);
         return res.status(200).send();
       }
 
+      // fetch intent (avec mini retry)
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       for (let i=0;i<3;i++){
         intent = await kvGet(intentKey);
+        intent = unwrapKVResult(intent) || intent;
         console.log('[INTENT] fetch', intentKey, intent ? 'HIT' : 'MISS');
         if (intent) break;
         await new Promise(r=>setTimeout(r, 250*(i+1)));
@@ -134,7 +141,7 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
 
-      memberId = memberId || intent.memberId || (emailKey ? await msFindMemberIdByEmail(env, emailKey).catch(()=>null) : null);
+      let memberId = memberFromLookup || intent.memberId || (emailKey ? await msFindMemberIdByEmail(env, emailKey).catch(()=>null) : null);
       if (!memberId){
         console.log('[MS] memberId not resolved -> skip');
         await kvSetEx(evtKey, 1, 30*24*3600);
@@ -157,7 +164,8 @@ module.exports = async (req, res) => {
       let memberId = null;
       if (stripeCustomerId){
         const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
-        memberId = m && m.memberId || null;
+        const mv = unwrapKVResult(m) || m;
+        memberId = mv && mv.memberId || null;
         console.log('[MAP] scus -> member', { env, stripeCustomerId, memberId: !!memberId });
       }
       if (!memberId && emailKey) memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
