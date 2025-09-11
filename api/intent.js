@@ -1,6 +1,13 @@
 // /api/intent.js
 const { kvSetEx, kvGet } = require('./kv.js');
 
+function logSet(key, val){ 
+  try {
+    const safe = JSON.stringify(val).slice(0,180);
+    console.log('[INTENT][KV SET]', key, safe);
+  } catch(_) { console.log('[INTENT][KV SET]', key); }
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
@@ -27,19 +34,22 @@ module.exports = async (req, res) => {
     };
 
     // write intent
-    await kvSetEx(`intent:${intentId}`, intent, 7*24*3600);
+    await kvSetEx(`intent:${intentId}`, intent, 7*24*3600); logSet(`intent:${intentId}`, intent);
 
     // pointers (env courant)
-    await kvSetEx(`latest-intent:${ENV}:${memberId}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
-    if (emailKey) await kvSetEx(`latest-intent-email:${ENV}:${emailKey}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
+    const p1 = { intentId, env:ENV, t:Date.now() };
+    await kvSetEx(`latest-intent:${ENV}:${memberId}`, p1, 7*24*3600); logSet(`latest-intent:${ENV}:${memberId}`, p1);
+    if (emailKey) { await kvSetEx(`latest-intent-email:${ENV}:${emailKey}`, p1, 7*24*3600); logSet(`latest-intent-email:${ENV}:${emailKey}`, p1); }
 
     // mirror (autre env)
-    await kvSetEx(`latest-intent:${MIRROR}:${memberId}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
-    if (emailKey) await kvSetEx(`latest-intent-email:${MIRROR}:${emailKey}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
+    const p2 = { intentId, env:ENV, t:Date.now() };
+    await kvSetEx(`latest-intent:${MIRROR}:${memberId}`, p2, 7*24*3600); logSet(`latest-intent:${MIRROR}:${memberId}`, p2);
+    if (emailKey) { await kvSetEx(`latest-intent-email:${MIRROR}:${emailKey}`, p2, 7*24*3600); logSet(`latest-intent-email:${MIRROR}:${emailKey}`, p2); }
 
     // default (filet de sécurité)
-    await kvSetEx(`latest-intent:default:${memberId}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
-    if (emailKey) await kvSetEx(`latest-intent-email:default:${emailKey}`, { intentId, env:ENV, t:Date.now() }, 7*24*3600);
+    const p3 = { intentId, env:ENV, t:Date.now() };
+    await kvSetEx(`latest-intent:default:${memberId}`, p3, 7*24*3600); logSet(`latest-intent:default:${memberId}`, p3);
+    if (emailKey) { await kvSetEx(`latest-intent-email:default:${emailKey}`, p3, 7*24*3600); logSet(`latest-intent-email:default:${emailKey}`, p3); }
 
     // read-back anti latence
     for (let i=0;i<3;i++){
