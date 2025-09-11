@@ -64,17 +64,31 @@ function getEnvFromEvent(event) {
   // Option: Si secrets séparés en Vercel
   if (process.env.STRIPE_WEBHOOK_SECRET_TEST && process.env.STRIPE_WEBHOOK_SECRET === process.env.STRIPE_WEBHOOK_SECRET_TEST) return 'test';
   // Via priceId (tes live sans 'test_')
-  const priceId = event.data.object.line_items?.data?.[0]?.price?.id || '';
-  if (priceId.includes('test_') || priceId.includes('price_test_')) return 'test'; // Adapte si tes test prefixed
+  const priceId = event.data.object.line_items?.data?.[0]?.price?.id || event.data.object.lines?.data?.[0]?.price?.id || ''; // Pour invoice
+  if (priceId.includes('test_') || priceId.includes('price_test_')) return 'test';
   return 'live';
 }
 
-/* ===== Retry KV Get ===== */
-async function retryKvGet(key, max = 3, delay = 1000) {
+/* ===== Retry KV Get avec Fallback Envs ===== */
+async function retryKvGet(key, max = 3, delay = 1000, env, emailKey) {
+  // Primary: Current env
   for (let i = 0; i < max; i++) {
     const val = await kvGet(key);
     if (val) return val;
     await new Promise(r => setTimeout(r, delay * (i + 1)));
+  }
+  // Fallback: Other env ('test' if live, 'live' if test) + 'default'
+  const fallbackEnvs = env === 'live' ? ['test', 'default'] : ['live', 'default'];
+  for (const fbEnv of fallbackEnvs) {
+    const fbKey = `latest-intent-email:${fbEnv}:${emailKey}`;
+    for (let i = 0; i < max; i++) {
+      const val = await kvGet(fbKey);
+      if (val) {
+        console.log(`Fallback success: ${fbEnv} for email=${emailKey}`);
+        return val;
+      }
+      await new Promise(r => setTimeout(r, delay * (i + 1)));
+    }
   }
   return null;
 }
@@ -103,22 +117,23 @@ module.exports = async (req, res) => {
   const env = getEnvFromEvent(event);
   console.log('Stripe webhook hit:', { type, env });
 
-  if (type !== 'checkout.session.completed') return res.status(200).send();
+  // Gère completed + paid (pour recurring)
+  if (type !== 'checkout.session.completed' && type !== 'invoice.paid') return res.status(200).send();
 
   try {
     const session = event.data.object;
-    const emailRaw = session.customer_details?.email?.trim().toLowerCase();
+    const emailRaw = session.customer_details?.email?.trim().toLowerCase() || session.customer_email?.trim().toLowerCase(); // Fallback pour invoice
     if (!emailRaw) {
       console.log('No email in session → skip');
       return res.status(200).send();
     }
     const emailKey = emailRaw;
 
-    // 1) Retrouver intent par email (env-specific)
+    // 1) Retrouver intent par email (avec fallback envs)
     const ptrKey = `latest-intent-email:${env}:${emailKey}`;
-    let ptr = await retryKvGet(ptrKey);
+    let ptr = await retryKvGet(ptrKey, 3, 1000, env, emailKey);
     if (!ptr?.intentId) {
-      console.log(`No intent for email=${emailKey} env=${env} → skip`);
+      console.log(`No intent for email=${emailKey} env=${env} (even fallback) → skip`);
       return res.status(200).send();
     }
 
@@ -127,10 +142,8 @@ module.exports = async (req, res) => {
       console.log('Intent unusable → skip');
       return res.status(200).send();
     }
-    if (intent.env && intent.env !== env) {
-      console.log(`ENV mismatch intent=${intent.env} webhook=${env} → skip`);
-      return res.status(200).send();
-    }
+    // Ignore env mismatch (fallback géré)
+    console.log(`Intent found (from ${ptr.env || 'fallback'}):`, { intentId: ptr.intentId, programs: intent.programs });
 
     // 2) Build updates avec tes 9 IDs
     const selected = new Set((intent.programs || []).map(s => String(s).toLowerCase()));
@@ -138,7 +151,7 @@ module.exports = async (req, res) => {
     FIELD_IDS.forEach(id => { updates[id] = selected.has(id) ? "1" : "0"; });
 
     // 3) Get memberId par query MS (safe fallback)
-    let memberId = session.metadata?.memberId; // Si futur metadata
+    let memberId = session.metadata?.memberId;
     if (!memberId) {
       const key = msApiKey(env);
       const qRes = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(emailKey)}`, {
