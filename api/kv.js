@@ -19,6 +19,7 @@ async function kvSetEx(key, obj, ttl){
     if (!r.ok) throw new Error(`KV set ${r.status}: ${await r.text()}`);
   }
 }
+
 async function kvGet(key){
   const r = await fetch(`${base()}/get/${encodeURIComponent(key)}`, { headers:h() });
   const txt = await r.text();
