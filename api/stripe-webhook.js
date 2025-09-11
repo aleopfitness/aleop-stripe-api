@@ -1,47 +1,63 @@
 // /api/stripe-webhook.js
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fetch = require('node-fetch');
+const Stripe = require('stripe');
+const { kvGet, kvSetEx } = require('./kv.js');
 
-/* ===== KV Utils (Avec Log Raw pour Debug) ===== */
-function kvBase() { return process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL; }
-function kvToken() { return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN; }
-function kvHeaders() { 
-  const t = kvToken(); 
-  if (!t) throw new Error('KV token missing'); 
-  return { Authorization: `Bearer ${t}` }; 
-}
-async function kvJson(res) {
-  const text = await res.text();
-  if (!res.ok) throw new Error(`KV ${res.status}: ${text}`);
-  try { 
-    const parsed = JSON.parse(text);
-    console.log('KV raw response:', { status: res.status, text: text.slice(0, 200) }); // Log raw pour debug
-    return parsed; 
-  } catch { return { result: text }; }
-}
-async function kvGet(key) {
-  const res = await fetch(`${kvBase()}/get/${encodeURIComponent(key)}`, { headers: kvHeaders() });
-  const d = await kvJson(res);
-  return d?.result ? JSON.parse(d.result) : null;
-}
-async function kvSetEx(key, value, ttl) {
-  const url = `${kvBase()}/set/${encodeURIComponent(key)}?ex=${ttl}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { ...kvHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ value: JSON.stringify(value) })
-  });
-  await kvJson(res);
+/* ---------- CONFIG PROGRAMS / CHAMPS MS ---------- */
+/** IMPORTANT : ici on suppose que les IDs des custom fields MS sont exactement ces slugs.
+ *  Si tes champs MS ont d'autres IDs techniques, remplace les clés ci-dessous. */
+const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
+
+/* ---------- HELPERS STRIPE ---------- */
+function stripeClient() {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) throw new Error('STRIPE_SECRET_KEY missing');
+  return new Stripe(key);
 }
 
-/* ===== Memberstack Admin ===== */
+// Vérifie la signature contre les 2 secrets (TEST puis LIVE). Détermine l'env sans ambiguïté.
+function verifyWithDualSecrets(rawBody, sig) {
+  const s = stripeClient();
+  const testSecret = process.env.STRIPE_WEBHOOK_SECRET_TEST;
+  const liveSecret = process.env.STRIPE_WEBHOOK_SECRET_LIVE;
+
+  if (!testSecret && !liveSecret) {
+    // fallback: secret unique (pas conseillé)
+    const only = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!only) throw new Error('No Stripe webhook secret configured');
+    return { event: s.webhooks.constructEvent(rawBody, sig, only), env: process.env.WEBHOOK_ENV || 'test' };
+  }
+
+  if (testSecret) {
+    try { return { event: s.webhooks.constructEvent(rawBody, sig, testSecret), env: 'test' }; } catch(_) {}
+  }
+  if (liveSecret) {
+    try { return { event: s.webhooks.constructEvent(rawBody, sig, liveSecret), env: 'live' }; } catch(_) {}
+  }
+  throw new Error('Invalid signature for both TEST and LIVE secrets');
+}
+
+/* ---------- HELPERS MEMBERSTACK ADMIN ---------- */
 function msApiKey(env) {
   return env === 'live'
     ? process.env.MEMBERSTACK_API_KEY_LIVE
-    : env === 'test'
-    ? process.env.MEMBERSTACK_API_KEY_TEST
-    : process.env.MEMBERSTACK_API_KEY;
+    : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY; // fallback
 }
+
+async function msFindMemberIdByEmail(env, email) {
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const r = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(email)}`, {
+    headers: { 'X-API-KEY': key }
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`MS query ${r.status}: ${t}`);
+  }
+  const data = await r.json();
+  return data?.data?.[0]?.id || null;
+}
+
 async function msPatchMember(env, memberId, customFields) {
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
@@ -53,49 +69,30 @@ async function msPatchMember(env, memberId, customFields) {
   if (!r.ok) throw new Error(`Memberstack update ${r.status}: ${await r.text()}`);
 }
 
-/* ===== IDs Exact des Champs (Tes 9 finaux) ===== */
-const FIELD_IDS = ['athletyx', 'upper', 'booty', 'flow', 'fight', 'cardio', 'mobility', 'cycle', 'force'];
-
-/* ===== Vérif Signature Stripe ===== */
-function verifyStripeSignature(rawBody, signature) {
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret) throw new Error('Stripe webhook secret missing');
-  return stripe.webhooks.constructEvent(rawBody, signature, secret);
-}
-
-/* ===== Déduire Env (Via PriceId ou Secret) ===== */
-function getEnvFromEvent(event) {
-  if (process.env.STRIPE_WEBHOOK_SECRET_TEST && process.env.STRIPE_WEBHOOK_SECRET === process.env.STRIPE_WEBHOOK_SECRET_TEST) return 'test';
-  const priceId = event.data.object.line_items?.data?.[0]?.price?.id || event.data.object.lines?.data?.[0]?.price?.id || '';
-  if (priceId.includes('test_') || priceId.includes('price_test_')) return 'test';
-  return 'live';
-}
-
-/* ===== Retry KV Get avec Fallback Envs ===== */
-async function retryKvGet(key, max = 3, delay = 1000, env, emailKey) {
-  // Primary: Current env
-  for (let i = 0; i < max; i++) {
-    const val = await kvGet(key);
-    if (val) return val;
-    await new Promise(r => setTimeout(r, delay * (i + 1)));
+/* ---------- UTILS ---------- */
+async function retry(fn, tries = 3, baseDelayMs = 300) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); } catch (e) { lastErr = e; }
+    await new Promise(r => setTimeout(r, baseDelayMs * (i + 1)));
   }
-  // Fallback: Other env ('test' if live, 'live' if test) + 'default'
-  const fallbackEnvs = env === 'live' ? ['test', 'default'] : ['live', 'default'];
-  for (const fbEnv of fallbackEnvs) {
-    const fbKey = `latest-intent-email:${fbEnv}:${emailKey}`;
-    for (let i = 0; i < max; i++) {
-      const val = await kvGet(fbKey);
-      if (val) {
-        console.log(`Fallback success: ${fbEnv} for email=${emailKey}`);
-        return val;
-      }
-      await new Promise(r => setTimeout(r, delay * (i + 1)));
-    }
-  }
-  return null;
+  throw lastErr;
 }
 
-/* ===== Handler ===== */
+function buildFlagsFromPrograms(programs) {
+  const set = new Set((programs || []).map(s => String(s || '').toLowerCase()));
+  const updates = {};
+  FIELD_IDS.forEach(id => { updates[id] = set.has(id) ? "1" : "0"; });
+  return updates;
+}
+
+function allZeroFlags() {
+  const updates = {};
+  FIELD_IDS.forEach(id => updates[id] = "0");
+  return updates;
+}
+
+/* ---------- HANDLER ---------- */
 module.exports = async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -104,91 +101,159 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
 
+  // Lire raw body (obligatoire pour signature)
   let body = ''; req.setEncoding('utf8'); req.on('data', c => body += c); await new Promise(r => req.on('end', r));
   const sig = req.headers['stripe-signature'];
 
-  let event;
+  // 1) Vérif signature & ENV
+  let event, env;
   try {
-    event = verifyStripeSignature(body, sig);
+    ({ event, env } = verifyWithDualSecrets(body, sig));
   } catch (e) {
     console.error('Stripe signature error:', e.message);
     return res.status(400).send('Invalid signature');
   }
 
   const type = event.type;
-  const env = getEnvFromEvent(event);
   console.log('Stripe webhook hit:', { type, env });
 
-  // Gère completed + paid (pour recurring)
-  if (type !== 'checkout.session.completed' && type !== 'invoice.paid') return res.status(200).send();
+  // On gère : paiement initial + renouvellements + changements + annulation
+  const HANDLE = new Set([
+    'checkout.session.completed',
+    'invoice.paid',
+    'customer.subscription.updated',
+    'customer.subscription.deleted'
+  ]);
+  if (!HANDLE.has(type)) return res.status(200).send();
 
   try {
-    const session = event.data.object;
-    const emailRaw = session.customer_details?.email?.trim().toLowerCase() || session.customer_email?.trim().toLowerCase(); // Fallback pour invoice
-    if (!emailRaw) {
-      console.log('No email in session → skip');
+    const obj = event.data.object;
+    const stripeCustomerId = obj.customer || obj.customer_id || null;
+    const emailKey = (obj.customer_details?.email || obj.customer_email || '').trim().toLowerCase() || null;
+
+    // Idempotence simple
+    const evtKey = `processed:${env}:${event.id}`;
+    const already = await kvGet(evtKey);
+    if (already) return res.status(200).send(); // déjà traité
+
+    // Chemin A — événements “positifs” (completed/paid) → appliquer INTENT (source front)
+    if (type === 'checkout.session.completed' || type === 'invoice.paid') {
+      // 1) Retrouver le pointeur d'intent par email (principe), avec retry
+      let ptr = null;
+      if (emailKey) {
+        ptr = await retry(() => kvGet(`latest-intent-email:${env}:${emailKey}`), 3, 300).catch(() => null);
+      }
+      // Fallback par memberId si possible
+      let memberId = null;
+      if (!ptr && emailKey) {
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(() => null);
+        if (memberId) {
+          ptr = await kvGet(`latest-intent:${env}:${memberId}`);
+        }
+      }
+
+      if (!ptr?.intentId) {
+        console.log(`No intent pointer found for env=${env}, email=${emailKey} → skip (no-op)`);
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+
+      // 2) Charger l'intent complet (retry & anti latency)
+      const intentKey = `intent:${ptr.intentId}`;
+      let intent = null;
+      for (let i = 0; i < 3; i++) {
+        intent = await kvGet(intentKey);
+        if (intent) break;
+        await new Promise(r => setTimeout(r, 300 * (i + 1)));
+      }
+      if (!intent || intent.status === 'applied') {
+        console.log(`Intent unusable for ${intentKey} → skip`);
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+
+      // 3) Résoudre le memberId
+      memberId = memberId || intent.memberId || (emailKey ? await msFindMemberIdByEmail(env, emailKey).catch(() => null) : null);
+      if (!memberId) {
+        console.log('MemberId not resolved → skip');
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+
+      // 4) Construire flags 1/0 depuis l’intent
+      const updates = buildFlagsFromPrograms(intent.programs);
+
+      // 5) PATCH MS
+      await msPatchMember(env, memberId, updates);
+
+      // 6) Marquer intent appliqué + idempotence + mapping customer→member
+      await kvSetEx(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 7*24*60*60);
+      await kvSetEx(evtKey, 1, 7*24*60*60);
+      if (stripeCustomerId) await kvSetEx(`map:scus:${env}:${stripeCustomerId}`, { memberId }, 30*24*60*60);
+
+      console.log(`Stripe applied (${env}) member=${memberId} updates=${JSON.stringify(updates)}`);
       return res.status(200).send();
     }
-    const emailKey = emailRaw;
 
-    // 1) Retrouver intent par email (avec fallback envs)
-    const ptrKey = `latest-intent-email:${env}:${emailKey}`;
-    let ptr = await retryKvGet(ptrKey, 3, 1000, env, emailKey);
-    if (!ptr?.intentId) {
-      console.log(`No intent for email=${emailKey} env=${env} (even fallback) → skip`);
+    // Chemin B — updated/deleted : resync minimal
+    if (type === 'customer.subscription.deleted') {
+      // On force tout à 0 (accès révoqué)
+      let memberId = null;
+      // Essaye mapping customer→member appris
+      if (stripeCustomerId) {
+        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
+        memberId = m?.memberId || null;
+      }
+      // Fallback email
+      if (!memberId && emailKey) {
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(() => null);
+      }
+      if (!memberId) {
+        console.log('Deleted: member introuvable → skip (no-op)');
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+      const updates = allZeroFlags();
+      await msPatchMember(env, memberId, updates);
+      await kvSetEx(evtKey, 1, 7*24*60*60);
+      console.log(`Subscription deleted → all flags 0 for member=${memberId}`);
       return res.status(200).send();
     }
 
-    // 2) Fetch full intent avec retry + log raw
-    let intent;
-    for (let i = 0; i < 3; i++) {
-      intent = await kvGet(`intent:${ptr.intentId}`);
-      console.log(`Intent fetch attempt ${i+1}:`, { intentId: ptr.intentId, intent: intent ? { status: intent.status, env: intent.env, programs: intent.programs } : 'null' });
-      if (intent) break;
-      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
-    }
-    if (!intent) {
-      console.log('Intent fetch failed after retry → skip');
+    if (type === 'customer.subscription.updated') {
+      // Cas simple : on ré-applique le dernier intent connu (si trouvé), sinon no-op
+      let memberId = null;
+      if (stripeCustomerId) {
+        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
+        memberId = m?.memberId || null;
+      }
+      if (!memberId && emailKey) {
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(() => null);
+      }
+      if (!memberId) {
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+      // Reprendre le dernier intent par member
+      const ptr = await kvGet(`latest-intent:${env}:${memberId}`);
+      if (!ptr?.intentId) {
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+      const intent = await kvGet(`intent:${ptr.intentId}`);
+      if (!intent) {
+        await kvSetEx(evtKey, 1, 7*24*60*60);
+        return res.status(200).send();
+      }
+      const updates = buildFlagsFromPrograms(intent.programs);
+      await msPatchMember(env, memberId, updates);
+      await kvSetEx(evtKey, 1, 7*24*60*60);
+      console.log(`Subscription updated → re-applied last intent for member=${memberId}`);
       return res.status(200).send();
     }
 
-    if (intent.status === 'applied') {
-      console.log('Intent applied → skip (clear KV if test)');
-      return res.status(200).send();
-    }
-
-    console.log(`Intent found (from ${ptr.env || 'fallback'}):`, { intentId: ptr.intentId, programs: intent.programs });
-
-    // 3) Build updates avec tes 9 IDs
-    const selected = new Set((intent.programs || []).map(s => String(s).toLowerCase()));
-    const updates = {};
-    FIELD_IDS.forEach(id => { updates[id] = selected.has(id) ? "1" : "0"; });
-
-    // 4) Get memberId par query MS (safe fallback)
-    let memberId = session.metadata?.memberId;
-    if (!memberId) {
-      const key = msApiKey(env);
-      const qRes = await fetch(`https://admin.memberstack.com/members?email=${encodeURIComponent(emailKey)}`, {
-        headers: { 'X-API-KEY': key }
-      });
-      if (!qRes.ok) throw new Error(`MS query ${qRes.status}: ${await qRes.text()}`);
-      const members = await qRes.json();
-      memberId = members?.data?.[0]?.id;
-    }
-    if (!memberId) {
-      console.log('No memberId for email → skip');
-      return res.status(200).send();
-    }
-
-    // 5) PATCH MS
-    await msPatchMember(env, memberId, updates);
-
-    // 6) Mark applied
-    try {
-      await kvSetEx(`intent:${intent.intentId}`, { ...intent, status: 'applied', appliedAt: Date.now() }, 7 * 24 * 60 * 60);
-    } catch (e) { console.warn('KV update failed:', e.message); }
-
-    console.log(`Stripe applied (${env}) ${memberId}: ${JSON.stringify(updates)}`);
+    // Fallback
+    await kvSetEx(evtKey, 1, 7*24*60*60);
     return res.status(200).send();
 
   } catch (err) {
