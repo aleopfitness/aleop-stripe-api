@@ -42,7 +42,7 @@ module.exports = async (req, res) => {
     await kvSetEx(`latest-intent:default:${memberId}`, p, 7*24*3600);
     if (emailKey) await kvSetEx(`latest-intent-email:default:${emailKey}`, p, 7*24*3600);
 
-    // read-back anti latence (juste pour vérifier qu'elle existe)
+    // read-back anti latence
     for (let i=0;i<3;i++){
       const check = await kvGet(`intent:${intentId}`);
       if (check) break;
