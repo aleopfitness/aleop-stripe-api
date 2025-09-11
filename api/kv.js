@@ -7,6 +7,30 @@ function token(){ return process.env.KV_REST_API_TOKEN || process.env.UPSTASH_RE
 function hJSON(){ return { Authorization:`Bearer ${token()}`, 'Content-Type':'application/json' }; }
 function h(){ return { Authorization:`Bearer ${token()}` }; }
 
+// Normalise n'importe quel format de retour KV vers l'objet stocké
+function unwrapKVResult(j){
+  if (j == null) return null;
+  // Upstash & Vercel renvoient un objet { result: ... }
+  const r = Object.prototype.hasOwnProperty.call(j, 'result') ? j.result : j;
+
+  // Cas 1: string JSON
+  if (typeof r === 'string') {
+    try { return JSON.parse(r); } catch { return r; }
+  }
+  // Cas 2: objet { value: "..." }
+  if (r && typeof r === 'object' && Object.prototype.hasOwnProperty.call(r, 'value')) {
+    const v = r.value;
+    if (typeof v === 'string') {
+      try { return JSON.parse(v); } catch { return v; }
+    }
+    return v ?? null;
+  }
+  // Cas 3: objet déjà l'objet attendu
+  if (r && typeof r === 'object') return r;
+
+  return null;
+}
+
 async function kvSetEx(key, obj, ttl){
   const v = JSON.stringify(obj);
   if (isVercelKV()){
@@ -24,9 +48,8 @@ async function kvGet(key){
   const r = await fetch(`${base()}/get/${encodeURIComponent(key)}`, { headers:h() });
   const txt = await r.text();
   if (!r.ok) throw new Error(`KV get ${r.status}: ${txt}`);
-  let j; try{ j = JSON.parse(txt); }catch{ return null; }
-  if (!j || j.result == null) return null;
-  try { return JSON.parse(j.result); } catch { return null; }
+  let j; try { j = JSON.parse(txt); } catch { return null; }
+  return unwrapKVResult(j);
 }
 
-module.exports = { kvSetEx, kvGet };
+module.exports = { kvSetEx, kvGet, unwrapKVResult };
