@@ -1,24 +1,25 @@
 /**
  * api/stripe-webhook.js
  *
- * ✅ Corrige Memberstack:
- *   - Utilise 'X-API-KEY' au lieu de 'Authorization: Bearer'
- *   - URIs sans /v2 : https://admin.memberstack.com/members/{...}
+ * Stripe ↔ Memberstack ↔ Upstash (Test & Live)
+ * - Memberstack Admin REST:
+ *     - GET member by email:  https://admin.memberstack.com/members/{email}
+ *     - PATCH member by id:   https://admin.memberstack.com/members/{memberId}
+ *   Headers: { 'X-API-KEY': <SECRET>, 'Content-Type':'application/json' }
  *
- * Gère les événements Stripe (test & live) :
- *   - checkout.session.completed  -> Active programmes achetés
- *   - invoice.paid                -> (sécurité) Active
- *   - customer.subscription.deleted -> Désactive
- *   - customer.subscription.updated -> Ré-applique selon status
+ * Événements Stripe gérés:
+ *   - checkout.session.completed  -> active programmes
+ *   - invoice.paid                -> (sécurité) active
+ *   - customer.subscription.deleted -> désactive
+ *   - customer.subscription.updated -> (ré-applique selon status)
  *
- * Stocke et retrouve l'intent via Upstash (pointeurs latest-intent-*)
+ * NB (Next.js pages/api): ajouter en bas:
+ *   export const config = { api: { bodyParser: false } };
  */
 
-const crypto = require('crypto');
 const Stripe = require('stripe');
 const STRIPE = Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-// ---------- Config ----------
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
 // Upstash (REST)
@@ -28,16 +29,10 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 // Stripe webhook secret
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-// ------------- Utils -------------
-function log(...args){ console.log('[WEBHOOK]', ...args); }
+// ---------- Utils ----------
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
-function normalizeEmail(s){
-  return (s || '').trim().toLowerCase();
-}
-
+function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
 function msApiKey(env){
-  // Pour test, on prend MEMBERSTACK_API_KEY_TEST en priorité, sinon MEMBERSTACK_API_KEY
   if (env === 'live') return process.env.MEMBERSTACK_API_KEY_LIVE;
   return process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
 }
@@ -45,47 +40,43 @@ function msHeaders(key){
   return { 'X-API-KEY': key, 'Content-Type':'application/json' };
 }
 
+// ---------- Upstash ----------
 async function upstash(command, args){
   if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('Upstash missing config');
-  const body = JSON.stringify([command, ...args]);
   const res = await fetch(UPSTASH_URL, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
-    body
+    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type':'application/json' },
+    body: JSON.stringify([command, ...args])
   });
   const data = await res.json().catch(()=>null);
   if (!res.ok) throw new Error(`Upstash ${command} ${res.status}: ${JSON.stringify(data)}`);
   return data;
 }
 async function kvSet(key, val, ttlSec){
-  if (ttlSec) return upstash('SET', [key, typeof val==='string'?val:JSON.stringify(val), 'EX', ttlSec]);
-  return upstash('SET', [key, typeof val==='string'?val:JSON.stringify(val)]);
+  const v = (typeof val === 'string') ? val : JSON.stringify(val);
+  if (ttlSec) return upstash('SET', [key, v, 'EX', ttlSec]);
+  return upstash('SET', [key, v]);
 }
 async function kvGet(key){
   const r = await upstash('GET', [key]);
   return r && typeof r.result === 'string' ? r.result : null;
 }
-async function kvDel(key){
-  return upstash('DEL', [key]);
-}
 
-// -------- Memberstack Admin REST (v2 sans /v2 dans l’URL) --------
+// ---------- Memberstack Admin REST ----------
 async function msFindMemberIdByEmail(env, email){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
-  const url = `https://admin.memberstack.com/members/${encodeURIComponent(email)}`; // GET par email
-  // Petit log non-sensible
+  const url = `https://admin.memberstack.com/members/${encodeURIComponent(email)}`;
   console.log('[MS] findByEmail', { env, email, keyPrefix: String(key).slice(0,6) });
   const r = await fetch(url, { headers: msHeaders(key) });
   const txt = await r.text();
   if (!r.ok){
-    // 404 si pas trouvé, on renvoie null
-    if (r.status === 404) return null;
+    if (r.status === 404) return null; // email inconnu
     throw new Error(`MS query ${r.status}: ${txt}`);
   }
   const d = JSON.parse(txt || '{}');
-  // Format attendu: { data: [{ id: 'mem_xxx', ...}] } ou objet direct selon implémentations
-  const id = d && d.data && d.data[0] && d.data[0].id ? d.data[0].id : (d && d.id ? d.id : null);
+  // Formats possibles: { data: [{ id: 'mem_...' }]} OU { id:'mem_...' }
+  const id = d?.data?.[0]?.id ?? d?.id ?? null;
   return id || null;
 }
 
@@ -93,7 +84,7 @@ async function msPatchMember(env, memberId, customFields){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
   const url = `https://admin.memberstack.com/members/${memberId}`;
-  console.log('[MS] PATCH customFields', { env, memberId, updates: customFields, keyPrefix: String(key).slice(0,6) });
+  console.log('[MS] PATCH customFields', { env, memberId, keyPrefix: String(key).slice(0,6), updates: customFields });
   const r = await fetch(url, {
     method: 'PATCH',
     headers: msHeaders(key),
@@ -107,8 +98,8 @@ async function msPatchMember(env, memberId, customFields){
   console.log('[MS] PATCH OK', { status: r.status });
 }
 
-// -------- Intent helpers --------
-function pointerKeysForEmail(email){
+// ---------- Intent helpers ----------
+function ptrKeysEmail(email){
   const e = normalizeEmail(email);
   return [
     `latest-intent-email:test:${e}`,
@@ -116,57 +107,46 @@ function pointerKeysForEmail(email){
     `latest-intent-email:${e}`,
   ];
 }
-function pointerKeysForMember(memberId){
+function ptrKeysMember(memberId){
   return [
     `latest-intent:test:${memberId}`,
     `latest-intent:live:${memberId}`,
     `latest-intent:${memberId}`,
   ];
 }
-
 async function loadIntentByEmail(email){
-  const keys = pointerKeysForEmail(email);
-  for (let k of keys){
-    const val = await kvGet(k);
-    if (val){
-      console.log('[INTENT] ptr hit', k, '->', val);
-      const data = await kvGet(val);
-      if (data){
-        try{ return JSON.parse(data); }catch(e){}
-      }
+  for (const k of ptrKeysEmail(email)){
+    const ref = await kvGet(k);
+    if (ref){
+      console.log('[INTENT] ptr hit', k, '->', ref);
+      const raw = await kvGet(ref);
+      if (raw){ try{ return JSON.parse(raw); }catch{} }
     }
   }
   return null;
 }
 async function loadIntentByMember(memberId){
-  const keys = pointerKeysForMember(memberId);
-  for (let k of keys){
-    const val = await kvGet(k);
-    if (val){
-      console.log('[INTENT] ptr hit', k, '->', val);
-      const data = await kvGet(val);
-      if (data){
-        try{ return JSON.parse(data); }catch(e){}
-      }
+  for (const k of ptrKeysMember(memberId)){
+    const ref = await kvGet(k);
+    if (ref){
+      console.log('[INTENT] ptr hit', k, '->', ref);
+      const raw = await kvGet(ref);
+      if (raw){ try{ return JSON.parse(raw); }catch{} }
     }
   }
   return null;
 }
 
 function buildCustomFields(programs, active){
-  const map = {};
-  for (const f of FIELD_IDS){
-    map[f] = '0';
-  }
+  const m = {};
+  for (const f of FIELD_IDS) m[f] = '0';
   if (active && Array.isArray(programs)){
-    for (const p of programs){
-      if (FIELD_IDS.includes(p)) map[p] = '1';
-    }
+    for (const p of programs) if (FIELD_IDS.includes(p)) m[p] = '1';
   }
-  return map;
+  return m;
 }
 
-// -------- Stripe raw body utils (nécessaire pour vérifier la signature) --------
+// ---------- Stripe raw body ----------
 async function readRawBody(req){
   return new Promise((resolve, reject) => {
     try{
@@ -178,7 +158,7 @@ async function readRawBody(req){
   });
 }
 
-// -------- Main handler --------
+// ---------- Handler ----------
 module.exports = async (req, res) => {
   if (req.method !== 'POST'){
     res.setHeader('Allow', 'POST');
@@ -205,51 +185,42 @@ module.exports = async (req, res) => {
 
   const env = event.livemode ? 'live' : 'test';
   const type = event.type;
-  log('Stripe event', { type, env, livemode: event.livemode });
+  console.log('Stripe webhook hit:', { type, env, livemode: event.livemode });
 
   try{
-    // ---- Extraire email / customer selon type ----
+    // --- extractions communes ---
     let email = null;
     let customerId = null;
 
     if (type === 'checkout.session.completed'){
       const s = event.data.object;
-      email = s.customer_details && s.customer_details.email ? s.customer_details.email : null;
-      customerId = s.customer || null;
+      email = s.customer_details?.email ?? null;
+      customerId = s.customer ?? null;
     } else if (type === 'invoice.paid' || type === 'invoice.payment_failed'){
       const inv = event.data.object;
-      customerId = inv.customer || null;
-      email = inv.customer_email || (inv.customer_details && inv.customer_details.email) || null;
+      customerId = inv.customer ?? null;
+      email = inv.customer_email || inv.customer_details?.email || null;
     } else if (type === 'customer.subscription.deleted' || type === 'customer.subscription.updated'){
       const sub = event.data.object;
-      customerId = sub.customer || null;
-      // pas d'email direct → on utilisera le mapping client->member ou un intent précédent
+      customerId = sub.customer ?? null;
     }
 
-    // ---- Tenter de retrouver le memberId et l'intent ----
+    // --- retrouver intent + member ---
     let intent = null;
     let memberId = null;
 
-    // 1) par email (le plus simple après checkout)
-    if (email){
-      intent = await loadIntentByEmail(email);
+    if (email) intent = await loadIntentByEmail(email);
+    if (intent?.memberId) memberId = intent.memberId;
+
+    if (!intent && email && !memberId){
+      const found = await msFindMemberIdByEmail(env, normalizeEmail(email));
+      if (found) memberId = found;
     }
 
-    // 2) si on a un memberId dans l'intent → OK
-    if (intent && intent.memberId) memberId = intent.memberId;
-
-    // 3) sinon, si on a un email mais pas d'intent → tenter Memberstack par email
-    if (!intent && email){
-      const mId = await msFindMemberIdByEmail(env, normalizeEmail(email));
-      if (mId) memberId = mId;
-    }
-
-    // 4) si toujours rien, tenter via un intent par memberId (si on l’a d’ailleurs)
     if (!intent && memberId){
       intent = await loadIntentByMember(memberId);
     }
 
-    // 5) fallback: si on a customerId Stripe, tu peux maintenir un mapping scus:{id} -> {memberId,email}
     if (!memberId && customerId){
       const mapRaw = await kvGet(`map:scus:${customerId}`);
       if (mapRaw){
@@ -257,16 +228,15 @@ module.exports = async (req, res) => {
           const map = JSON.parse(mapRaw);
           if (map.memberId) memberId = map.memberId;
           if (!intent && map.email) intent = await loadIntentByEmail(map.email);
-        }catch(e){}
+        }catch{}
       }
     }
 
-    // ---- Déterminer action selon type ----
-    const activateTypes = new Set(['checkout.session.completed', 'invoice.paid']);
+    // --- déterminer action ---
+    const activateTypes = new Set(['checkout.session.completed','invoice.paid']);
     const deactivateTypes = new Set(['customer.subscription.deleted']);
     const maybeUpdateTypes = new Set(['customer.subscription.updated']);
 
-    // Programmes et custom fields
     let programs = (intent && Array.isArray(intent.programs)) ? intent.programs : [];
     let applyActive = false;
 
@@ -274,20 +244,16 @@ module.exports = async (req, res) => {
       applyActive = true;
     } else if (deactivateTypes.has(type)){
       applyActive = false;
-      // en cas de delete, si pas d'intent, on met tout à 0
-      if (!programs || programs.length === 0) programs = FIELD_IDS.slice(0);
+      if (!programs || programs.length === 0) programs = FIELD_IDS.slice(0); // tout à 0
     } else if (maybeUpdateTypes.has(type)){
-      // selon status de la sub
       const sub = event.data.object;
-      const activeStatuses = new Set(['active','trialing','past_due','incomplete']); // ajuste si besoin
+      const activeStatuses = new Set(['active','trialing','past_due','incomplete']);
       applyActive = activeStatuses.has(sub.status);
       if (!programs || programs.length === 0){
-        // si on n'a pas de programmes en mémoire, on ne sait pas quoi activer → pas d'update destructive
         console.log('[INFO] subscription.updated sans programmes connus -> skip fields');
         return res.status(200).json({ ok:true, info:'no-programs-known' });
       }
     } else {
-      // événement non géré: ACK
       return res.status(200).json({ ok:true, ignored:true });
     }
 
@@ -296,26 +262,27 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok:true, skipped:'no-member-id' });
     }
 
-    // Construire la payload customFields
     const customFields = buildCustomFields(programs, applyActive);
-
-    // PATCH Memberstack
     await msPatchMember(env, memberId, customFields);
 
-    // Marquer intent appliqué + mapper le customerId → member/email pour futurs événements
-    if (intent && intent.id){
-      await kvSet(intent.id, JSON.stringify({ ...intent, appliedAt: Date.now() }), 60*60*24*30);
+    // persistance post-traitement
+    if (intent?.id){
+      await kvSet(intent.id, { ...intent, appliedAt: Date.now() }, 60*60*24*30);
     }
     if (customerId){
-      await kvSet(`map:scus:${customerId}`, JSON.stringify({ memberId, email: email || (intent && intent.email) || null }), 60*60*24*180);
+      await kvSet(`map:scus:${customerId}`, { memberId, email: email || intent?.email || null }, 60*60*24*180);
     }
 
     return res.status(200).json({ ok:true, memberId, applied: applyActive, programs });
   }catch(err){
     console.error('Webhook handler error:', err && err.stack || err);
-    return res.status(500).json({ ok:false, error: String(err && err.message || err) });
+    return res.status(500).json({ ok:false, error: String(err?.message || err) });
   }
 };
 
-// ⚠️ Si tu es dans Next.js (pages/api), ajoute ceci dans le même fichier :
-// export const config = { api: { bodyParser: false } };
+// ⚠️ Si tu utilises Next.js pages/api :
+/*
+export const config = {
+  api: { bodyParser: false }
+};
+*/
