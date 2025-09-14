@@ -1,108 +1,87 @@
-/**
- * api/intent.js
- *
- * Reçoit depuis le front:
- *   { env, memberId, email, programs, seats, priceId, createdAt }
- *
- * Stocke dans Upstash:
- *   - intent:<id> => { id, env, memberId, email, programs, seats, priceId, createdAt, status:'pending' }
- *   - latest-intent:<env>:<memberId>     -> intent:<id>
- *   - latest-intent:<memberId>          -> intent:<id>            (fallback)
- *   - latest-intent-email:<env>:<email> -> intent:<id>
- *   - latest-intent-email:<email>       -> intent:<id>            (fallback)
- *
- * Réponse:
- *   200 { ok:true, intentId }
- */
+// /api/intent.js
+// Version sans dépendance à ./kv.js — Upstash via REST direct
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
-// Upstash (REST)
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// ---------- Utils ----------
 function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
-function uniq(arr){ return Array.from(new Set(arr || [])); }
+function uniq(a){ return Array.from(new Set(a || [])); }
 function clampPrograms(list){
-  const ids = new Set(FIELD_IDS);
-  return uniq((list || []).map(String).map(s=>s.trim().toLowerCase()).filter(x => ids.has(x)));
+  const set = new Set(FIELD_IDS);
+  return uniq((list || [])
+    .map(x => String(x || '').trim().toLowerCase())
+    .filter(x => set.has(x)));
 }
 function isTestEnv(v){ return String(v).toLowerCase() === 'test'; }
-function safeInt(n, def=0){
-  const x = Number(n);
-  return Number.isFinite(x) ? Math.max(0, Math.floor(x)) : def;
+
+async function upstash(cmd, args){
+  if (!UPSTASH_URL || !UPSTASH_TOKEN){
+    const msg = `Upstash missing config: ${!UPSTASH_URL?'UPSTASH_REDIS_REST_URL ':''}${!UPSTASH_TOKEN?'UPSTASH_REDIS_REST_TOKEN':''}`.trim();
+    throw new Error(msg);
+  }
+  const r = await fetch(UPSTASH_URL, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify([cmd, ...args])
+  });
+  const data = await r.json().catch(()=>null);
+  if (!r.ok) throw new Error(`Upstash ${cmd} ${r.status}: ${JSON.stringify(data)}`);
+  return data;
 }
+async function kvSet(key, val, ttlSec){
+  const v = typeof val === 'string' ? val : JSON.stringify(val);
+  return ttlSec
+    ? upstash('SET', [key, v, 'EX', ttlSec])
+    : upstash('SET', [key, v]);
+}
+async function kvGet(key){
+  const r = await upstash('GET', [key]);
+  return (r && typeof r.result === 'string') ? r.result : null;
+}
+
 function newIntentId(){
-  // i_<base36 timestamp>_<base36 rand>
-  const ts = Date.now().toString(36);
+  const ts  = Date.now().toString(36);
   const rnd = Math.floor(Math.random()*36**6).toString(36).padStart(6,'0');
   return `i_${ts}_${rnd}`;
 }
 
-// ---------- Upstash ----------
-async function upstash(command, args){
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) throw new Error('Upstash missing config');
-  const res = await fetch(UPSTASH_URL, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify([command, ...args])
-  });
-  const data = await res.json().catch(()=>null);
-  if (!res.ok) throw new Error(`Upstash ${command} ${res.status}: ${JSON.stringify(data)}`);
-  return data;
-}
-async function kvSet(key, val, ttlSec){
-  const v = (typeof val === 'string') ? val : JSON.stringify(val);
-  if (ttlSec) return upstash('SET', [key, v, 'EX', ttlSec]);
-  return upstash('SET', [key, v]);
+function cors(res){
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type');
 }
 
-// ---------- CORS ----------
-function setCors(res){
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-}
-
-// ---------- Handler ----------
 module.exports = async (req, res) => {
-  setCors(res);
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST'){
-    res.setHeader('Allow', 'POST, OPTIONS');
-    return res.status(405).send('Method Not Allowed');
-  }
+  cors(res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST')   return res.status(405).json({ ok:false, error:'Method Not Allowed' });
 
   try{
-    const body = typeof req.body === 'string' ? JSON.parse(req.body||'{}') : (req.body || {});
-    let { env, memberId, email, programs, seats, priceId, createdAt } = body;
+    const b = (typeof req.body === 'object' && req.body !== null) ? req.body : JSON.parse(req.body||'{}');
 
-    // --- validations de base ---
+    let { env, memberId, email, programs = [], seats, priceId, createdAt } = b || {};
     env = isTestEnv(env) ? 'test' : 'live';
+
     if (!memberId || typeof memberId !== 'string') {
-      return res.status(400).json({ ok:false, error:'memberId missing' });
+      return res.status(400).json({ ok:false, error:'memberId required' });
     }
     email = normalizeEmail(email);
-    if (!email){
-      return res.status(400).json({ ok:false, error:'email missing' });
-    }
-    programs = clampPrograms(programs);
-    const qty = programs.length;
-    seats = safeInt(seats, qty);
-    if (seats !== qty){
-      // On force la cohérence: seats = nb de programmes
-      seats = qty;
-    }
-    if (!priceId || typeof priceId !== 'string'){
-      return res.status(400).json({ ok:false, error:'priceId missing' });
-    }
-    if (!createdAt || typeof createdAt !== 'string'){
-      createdAt = new Date().toISOString();
+    if (!email) {
+      return res.status(400).json({ ok:false, error:'email required' });
     }
 
-    // --- assembler l’objet intent ---
-    const intentId = newIntentId();
+    programs = clampPrograms(programs);
+    if (programs.length === 0){
+      return res.status(400).json({ ok:false, error:'programs required (non-empty & valid IDs)' });
+    }
+
+    if (!priceId || typeof priceId !== 'string'){
+      return res.status(400).json({ ok:false, error:'priceId required' });
+    }
+
+    const intentId  = newIntentId();
     const intentKey = `intent:${intentId}`;
 
     const intent = {
@@ -111,34 +90,40 @@ module.exports = async (req, res) => {
       memberId,
       email,
       programs,
-      seats,
+      seats: Number.isFinite(+seats) ? Math.max(0, parseInt(seats,10)) : programs.length,
       priceId,
-      createdAt,
+      createdAt: createdAt || new Date().toISOString(),
       status: 'pending'
     };
 
-    // --- stockage principal (intent) ---
-    // TTL 30 jours
+    // write intent (TTL 30 jours)
     await kvSet(intentKey, intent, 60*60*24*30);
 
-    // --- pointeurs par memberId ---
-    await kvSet(`latest-intent:${env}:${memberId}`, intentKey, 60*60*24*30);
-    await kvSet(`latest-intent:${memberId}`,         intentKey, 60*60*24*30); // fallback
+    // pointers
+    const p = { intentId: intentId, env, t: Date.now() };
+    await kvSet(`latest-intent:${env}:${memberId}`, p, 60*60*24*30);
+    await kvSet(`latest-intent-email:${env}:${email}`, p, 60*60*24*30);
 
-    // --- pointeurs par email ---
-    await kvSet(`latest-intent-email:${env}:${email}`, intentKey, 60*60*24*30);
-    await kvSet(`latest-intent-email:${email}`,         intentKey, 60*60*24*30); // fallback
+    // miroirs (pour robustesse env)
+    const MIRROR = env === 'live' ? 'test' : 'live';
+    await kvSet(`latest-intent:${MIRROR}:${memberId}`, p, 60*60*24*30);
+    await kvSet(`latest-intent-email:${MIRROR}:${email}`, p, 60*60*24*30);
 
-    console.log('[INTENT] created', {
-      env, memberId, email, programs, seats, priceId, intentId
-    });
+    // défauts
+    await kvSet(`latest-intent:default:${memberId}`, p, 60*60*24*30);
+    await kvSet(`latest-intent-email:default:${email}`, p, 60*60*24*30);
 
-    return res.status(200).json({ ok:true, intentId: intentKey });
-  }catch(err){
-    console.error('intent error:', err && err.stack || err);
-    return res.status(500).json({ ok:false, error: String(err?.message || err) });
+    // read-after-write (anti-latence)
+    for (let i=0;i<3;i++){
+      const chk = await kvGet(intentKey);
+      if (chk) break;
+      await new Promise(r=>setTimeout(r, 150*(i+1)));
+    }
+
+    console.log('[INTENT] created', { env, memberId, email, programs, priceId, intentId });
+    return res.status(200).json({ ok:true, intentId });
+  }catch(e){
+    console.error('[INTENT] error:', e && e.message ? e.message : e);
+    return res.status(500).json({ ok:false, error: String(e && e.message || e) });
   }
 };
-
-// ⚠️ Si tu utilises Next.js (pages/api), tu n’as rien à ajouter ici.
-//    (Pas de vérif signature Stripe sur cette route, JSON standard)
