@@ -1,29 +1,47 @@
-// /api/intent.js
-// Version sans dépendance à ./kv.js — Upstash via REST direct
+/**
+ * /api/intent.js
+ * Crée un intent d'achat et enregistre des pointeurs dans Upstash/Vercel KV.
+ *
+ * Input (POST JSON):
+ *   { env, memberId, email, programs[], seats, priceId, createdAt }
+ *
+ * Sortie:
+ *   200 { ok:true, intentId }   // intentId sans le préfixe "intent:"
+ */
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
-const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+/* --- Upstash / Vercel KV : auto-detect des variables --- */
+const UPSTASH_URL =
+  process.env.UPSTASH_REDIS_REST_URL ||
+  process.env.KV_REST_API_URL ||
+  process.env.KV_URL ||
+  process.env.REDIS_URL;
+
+const UPSTASH_TOKEN =
+  process.env.UPSTASH_REDIS_REST_TOKEN ||
+  process.env.KV_REST_API_TOKEN ||
+  process.env.KV_REST_API_READ_ONLY_TOKEN;
 
 function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
 function uniq(a){ return Array.from(new Set(a || [])); }
 function clampPrograms(list){
-  const set = new Set(FIELD_IDS);
-  return uniq((list || [])
-    .map(x => String(x || '').trim().toLowerCase())
-    .filter(x => set.has(x)));
+  const ok = new Set(FIELD_IDS);
+  return uniq((list||[]).map(x=>String(x||'').trim().toLowerCase()).filter(x=>ok.has(x)));
 }
 function isTestEnv(v){ return String(v).toLowerCase() === 'test'; }
 
 async function upstash(cmd, args){
   if (!UPSTASH_URL || !UPSTASH_TOKEN){
-    const msg = `Upstash missing config: ${!UPSTASH_URL?'UPSTASH_REDIS_REST_URL ':''}${!UPSTASH_TOKEN?'UPSTASH_REDIS_REST_TOKEN':''}`.trim();
-    throw new Error(msg);
+    const miss = [
+      !UPSTASH_URL ? 'UPSTASH_REDIS_REST_URL/KV_REST_API_URL/KV_URL/REDIS_URL' : null,
+      !UPSTASH_TOKEN ? 'UPSTASH_REDIS_REST_TOKEN/KV_REST_API_TOKEN' : null
+    ].filter(Boolean).join(' & ');
+    throw new Error('Upstash missing config: ' + miss);
   }
   const r = await fetch(UPSTASH_URL, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}`, 'Content-Type':'application/json' },
     body: JSON.stringify([cmd, ...args])
   });
   const data = await r.json().catch(()=>null);
@@ -32,9 +50,7 @@ async function upstash(cmd, args){
 }
 async function kvSet(key, val, ttlSec){
   const v = typeof val === 'string' ? val : JSON.stringify(val);
-  return ttlSec
-    ? upstash('SET', [key, v, 'EX', ttlSec])
-    : upstash('SET', [key, v]);
+  return ttlSec ? upstash('SET', [key, v, 'EX', ttlSec]) : upstash('SET', [key, v]);
 }
 async function kvGet(key){
   const r = await upstash('GET', [key]);
@@ -59,33 +75,23 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST')   return res.status(405).json({ ok:false, error:'Method Not Allowed' });
 
   try{
-    const b = (typeof req.body === 'object' && req.body !== null) ? req.body : JSON.parse(req.body||'{}');
+    const body = (typeof req.body === 'object' && req.body) ? req.body : JSON.parse(req.body||'{}');
+    let { env, memberId, email, programs = [], seats, priceId, createdAt } = body || {};
 
-    let { env, memberId, email, programs = [], seats, priceId, createdAt } = b || {};
     env = isTestEnv(env) ? 'test' : 'live';
-
-    if (!memberId || typeof memberId !== 'string') {
-      return res.status(400).json({ ok:false, error:'memberId required' });
-    }
+    if (!memberId || typeof memberId !== 'string') return res.status(400).json({ ok:false, error:'memberId required' });
     email = normalizeEmail(email);
-    if (!email) {
-      return res.status(400).json({ ok:false, error:'email required' });
-    }
+    if (!email) return res.status(400).json({ ok:false, error:'email required' });
 
     programs = clampPrograms(programs);
-    if (programs.length === 0){
-      return res.status(400).json({ ok:false, error:'programs required (non-empty & valid IDs)' });
-    }
-
-    if (!priceId || typeof priceId !== 'string'){
-      return res.status(400).json({ ok:false, error:'priceId required' });
-    }
+    if (!programs.length) return res.status(400).json({ ok:false, error:'programs required (non-empty & valid IDs)' });
+    if (!priceId || typeof priceId !== 'string') return res.status(400).json({ ok:false, error:'priceId required' });
 
     const intentId  = newIntentId();
     const intentKey = `intent:${intentId}`;
 
     const intent = {
-      id: intentKey,
+      id: intentKey,               // clé KV
       env,
       memberId,
       email,
@@ -96,28 +102,27 @@ module.exports = async (req, res) => {
       status: 'pending'
     };
 
-    // write intent (TTL 30 jours)
+    // Stockage principal (TTL 30 jours)
     await kvSet(intentKey, intent, 60*60*24*30);
 
-    // pointers
-    const p = { intentId: intentId, env, t: Date.now() };
-    await kvSet(`latest-intent:${env}:${memberId}`, p, 60*60*24*30);
-    await kvSet(`latest-intent-email:${env}:${email}`, p, 60*60*24*30);
+    // Pointeurs (env + miroirs + défauts) → JSON { intentId, env, t }
+    const ptr = { intentId, env, t: Date.now() };
+    const mirror = env === 'live' ? 'test' : 'live';
 
-    // miroirs (pour robustesse env)
-    const MIRROR = env === 'live' ? 'test' : 'live';
-    await kvSet(`latest-intent:${MIRROR}:${memberId}`, p, 60*60*24*30);
-    await kvSet(`latest-intent-email:${MIRROR}:${email}`, p, 60*60*24*30);
+    await kvSet(`latest-intent:${env}:${memberId}`, ptr, 60*60*24*30);
+    await kvSet(`latest-intent-email:${env}:${email}`, ptr, 60*60*24*30);
 
-    // défauts
-    await kvSet(`latest-intent:default:${memberId}`, p, 60*60*24*30);
-    await kvSet(`latest-intent-email:default:${email}`, p, 60*60*24*30);
+    await kvSet(`latest-intent:${mirror}:${memberId}`, ptr, 60*60*24*30);
+    await kvSet(`latest-intent-email:${mirror}:${email}`, ptr, 60*60*24*30);
 
-    // read-after-write (anti-latence)
+    await kvSet(`latest-intent:default:${memberId}`, ptr, 60*60*24*30);
+    await kvSet(`latest-intent-email:default:${email}`, ptr, 60*60*24*30);
+
+    // read-after-write anti latence
     for (let i=0;i<3;i++){
       const chk = await kvGet(intentKey);
       if (chk) break;
-      await new Promise(r=>setTimeout(r, 150*(i+1)));
+      await new Promise(r=>setTimeout(r, 120*(i+1)));
     }
 
     console.log('[INTENT] created', { env, memberId, email, programs, priceId, intentId });
