@@ -26,25 +26,29 @@ function msApiKey(env){
     ? process.env.MEMBERSTACK_API_KEY_LIVE
     : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
 }
+function msHeaders(key){
+  return { 'X-API-KEY': key, 'Content-Type': 'application/json' };
+}
+
 async function msFindMemberIdByEmail(env, email){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing MS key for env=${env}`);
   const r = await fetch(`https://admin.memberstack.com/v2/members?email=${encodeURIComponent(email)}`, {
-    headers: { 'Authorization': `Bearer ${key}` }
+    headers: msHeaders(key)
   });
   if (!r.ok) throw new Error(`MS v2 query ${r.status}: ${await r.text()}`);
   const d = await r.json();
   const id = d && d.data && d.data[0] && d.data[0].id ? d.data[0].id : null;
-  console.log('[MS] findByEmail', { env, email, found: !!id });
+  console.log('[MS] findByEmail', { env, email, found: !!id, keyPrefix: String(key).slice(0,6) });
   return id;
 }
 async function msPatchMember(env, memberId, customFields){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing MS key for env=${env}`);
-  console.log('[MS] PATCH customFields', { env, memberId, updates: customFields });
+  console.log('[MS] PATCH customFields', { env, memberId, updates: customFields, keyPrefix: String(key).slice(0,6) });
   const r = await fetch(`https://admin.memberstack.com/v2/members/${memberId}`, {
     method: 'PATCH',
-    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    headers: msHeaders(key),
     body: JSON.stringify({ customFields })
   });
   const txt = await r.text();
