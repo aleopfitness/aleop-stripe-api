@@ -61,9 +61,9 @@ async function testSync(req) {
   // Run sync logic
   let allMembers = await msGetAllMembers(ENV);
   let newMember = allMembers.find(m => m.id === newMemberId);
-  if (!newMember) newMember = { id: newMemberId, memberships: [{ priceId: newPlanId }] };  // Mock for test
-  // ... (rest as below)
-  return { ok: true, simulated: true, planId: newPlanId };
+  if (!newMember) newMember = { id: newMemberId, memberships: [{ priceId: newPlanId }] };  // Mock
+  // ... (rest as below, but return early for test)
+  return { ok: true, simulated: true, planId: newPlanId, membersCount: allMembers.length };
 }
 
 /* --- Handler --- */
@@ -90,15 +90,15 @@ module.exports = async (req, res) => {
   }
 
   const { event, timestamp, payload } = body;
-  console.log('=== MS WEBHOOK START ===', { event, timestamp, newMemberId: payload?.id, teamId: payload?.teamId, fullPayloadKeys: Object.keys(payload || {}) });
+  console.log('=== MS WEBHOOK START ===', { event, timestamp, newMemberId: payload?.id || payload?.member?.id, teamId: payload?.teamId, fullPayloadKeys: Object.keys(payload || {}) });
 
   if (event !== 'team.member.added') {
     console.log('[MS] Skip non-team.added event:', event);
     return res.status(200).send();
   }
 
-  const ENV = 'test';  // Default
-  const newMemberId = payload.id;  // Or payload.member.id if nested
+  const ENV = 'test';  // Default ; tweak if needed
+  const newMemberId = payload.id || payload.member?.id;  // Nested possible
   const teamId = payload.teamId;  // Log for debug
   console.log('[MS] Parsed newMemberId:', newMemberId, 'teamId:', teamId);
 
@@ -107,72 +107,67 @@ module.exports = async (req, res) => {
     return res.status(200).send();
   }
 
-  // Fetch all to get newPlanId from memberships
-  let allMembers;
   try {
-    allMembers = await msGetAllMembers(ENV);
+    // Fetch all to get newPlanId from memberships
+    let allMembers = await msGetAllMembers(ENV);
     console.log('[MS] Fetched', allMembers.length, 'members');
-  } catch(e) {
-    console.error('[MS] Fetch allMembers error:', e);
+
+    const newMember = allMembers.find(m => m.id === newMemberId);
+    if (!newMember) {
+      console.log('[MS] New member not found in list -> skip');
+      return res.status(200).send();
+    }
+
+    const newPlanId = newMember.memberships ? newMember.memberships[0]?.priceId : null;  // From memberships
+    console.log('[MS] Parsed newPlanId from memberships:', newPlanId);
+
+    if (!newPlanId) {
+      console.log('[MS] No planId in memberships -> skip');
+      return res.status(200).send();
+    }
+
+    // Idempotence : Skip if syncedAt exists
+    if (newMember.customFields && newMember.customFields.syncedAt) {
+      console.log('[MS] Already synced (syncedAt exists), skip');
+      return res.status(200).send();
+    }
+
+    // Check team plan
+    if (!newPlanId.includes('-2-') && !newPlanId.includes('-3-') && !newPlanId.includes('-4-') && !newPlanId.includes('-5-') && !newPlanId.includes('-6-') && !newPlanId.includes('-7-') && !newPlanId.includes('-8-') && !newPlanId.includes('-9-')) {
+      console.log('[MS] Not team plan -> skip sync');
+      return res.status(200).send();
+    }
+
+    // Find team members for this plan
+    const teamMembers = allMembers.filter(m => m.memberships && m.memberships.some(mem => mem.priceId === newPlanId));
+    console.log('[MS] Team members for planId', newPlanId, ':', teamMembers.length);
+
+    // Find principal : isPrincipal='1'
+    const principal = teamMembers.find(m => m.customFields && m.customFields.isPrincipal === '1');
+    console.log('[MS] Principal found:', principal ? principal.id : 'MISS', 'fields:', principal?.customFields);
+
+    if (!principal || !principal.customFields) {
+      console.error('[MS] No principal found or no fields -> manual review');
+      return res.status(200).send();
+    }
+
+    // Copy fields sans isPrincipal
+    const fieldsToCopy = { ...principal.customFields };
+    delete fieldsToCopy.isPrincipal;
+    fieldsToCopy.syncedAt = Date.now().toString();  // For idempotence
+    console.log('[MS] Fields to copy:', fieldsToCopy);
+
+    // Patch new member
+    await msPatchMember(ENV, newMemberId, fieldsToCopy);
+
+    console.log(`[SUCCESS] Synced fields to new member ${newMemberId} from principal ${principal.id}`);
+    console.log('=== MS WEBHOOK END (SUCCESS) ===');
     return res.status(200).send();
+
+  } catch(err) {
+    console.error('=== MS WEBHOOK ERROR ===', err && err.message ? err.message : err);
+    if (err && err.stack) console.error(err.stack);
+    console.log('=== MS WEBHOOK END (ERROR) ===');
+    return res.status(500).send('Handler error');
   }
-
-  const newMember = allMembers.find(m => m.id === newMemberId);
-  if (!newMember) {
-    console.log('[MS] New member not found in list -> skip');
-    return res.status(200).send();
-  }
-
-  const newPlanId = newMember.memberships ? newMember.memberships[0]?.priceId : null;  // From memberships
-  console.log('[MS] Parsed newPlanId from memberships:', newPlanId);
-
-  if (!newPlanId) {
-    console.log('[MS] No planId in memberships -> skip');
-    return res.status(200).send();
-  }
-
-  // Idempotence : Skip if syncedAt exists
-  if (newMember.customFields && newMember.customFields.syncedAt) {
-    console.log('[MS] Already synced (syncedAt exists), skip');
-    return res.status(200).send();
-  }
-
-  // Check team plan
-  if (!newPlanId.includes('-2-') && !newPlanId.includes('-3-') && !newPlanId.includes('-4-') && !newPlanId.includes('-5-') && !newPlanId.includes('-6-') && !newPlanId.includes('-7-') && !newPlanId.includes('-8-') && !newPlanId.includes('-9-')) {
-    console.log('[MS] Not team plan -> skip sync');
-    return res.status(200).send();
-  }
-
-  // Find team members for this plan
-  const teamMembers = allMembers.filter(m => m.memberships && m.memberships.some(mem => mem.priceId === newPlanId));
-  console.log('[MS] Team members for planId', newPlanId, ':', teamMembers.length);
-
-  // Find principal : isPrincipal='1'
-  const principal = teamMembers.find(m => m.customFields && m.customFields.isPrincipal === '1');
-  console.log('[MS] Principal found:', principal ? principal.id : 'MISS', 'fields:', principal?.customFields);
-
-  if (!principal || !principal.customFields) {
-    console.error('[MS] No principal found or no fields -> manual review');
-    return res.status(200).send();
-  }
-
-  // Copy fields sans isPrincipal
-  const fieldsToCopy = { ...principal.customFields };
-  delete fieldsToCopy.isPrincipal;
-  fieldsToCopy.syncedAt = Date.now().toString();  // For idempotence
-  console.log('[MS] Fields to copy:', fieldsToCopy);
-
-  // Patch new member
-  await msPatchMember(ENV, newMemberId, fieldsToCopy);
-
-  console.log(`[SUCCESS] Synced fields to new member ${newMemberId} from principal ${principal.id}`);
-  console.log('=== MS WEBHOOK END (SUCCESS) ===');
-  return res.status(200).send();
-
-} catch(err) {
-  console.error('=== MS WEBHOOK ERROR ===', err && err.message ? err.message : err);
-  if (err && err.stack) console.error(err.stack);
-  console.log('=== MS WEBHOOK END (ERROR) ===');
-  return res.status(500).send('Handler error');
-}
 };
