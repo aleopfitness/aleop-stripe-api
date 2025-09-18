@@ -4,7 +4,7 @@
  * - Event: team.member.added (acception invitation) → copie SEULEMENT programs flags + teamowner='0'
  * - Event: team.member.removed → deactivate (flags à '0')
  * - Utilise msGetMember / msPatchMember (comme stripe-webhook)
- * - Svix signature pour sécurité
+ * - Svix signature pour sécurité (MS_WEBHOOK_SECRET_TEST pour test)
  * - KV optionnel pour idempotence
  *
  * ⚠️ Next.js: export const config = { api: { bodyParser: false } };
@@ -88,10 +88,18 @@ module.exports = async (req, res) => {
   const svix_timestamp = headers['svix-timestamp'];
   const svix_signature = headers['svix-signature'];
 
+  // Force env 'test' comme demandé
+  const env = 'test';
+  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_TEST;  // Utilise _TEST pour test
+  if (!msWebhookSecret) {
+    console.error('MS webhook secret missing for env=test: MS_WEBHOOK_SECRET_TEST');
+    return res.status(500).send('MS_WEBHOOK_SECRET_TEST missing');
+  }
+  console.log('[MS] Using webhook secret for env=test (prefix:', msWebhookSecret.slice(0,6), ')');
+
   let event;
   try {
-    if (!process.env.MS_WEBHOOK_SECRET) throw new Error('MS_WEBHOOK_SECRET missing');
-    const wh = new Svix(process.env.MS_WEBHOOK_SECRET);
+    const wh = new Svix(msWebhookSecret);
     const headerPayload = svix_id ? `${svix_id} > ${svix_timestamp}` : '';
     const body = Buffer.from(payloadStr);
     event = wh.verify(body, svix_signature, headerPayload ? Buffer.from(headerPayload) : undefined);
@@ -103,7 +111,6 @@ module.exports = async (req, res) => {
   const fullPayload = JSON.parse(payloadStr);
   console.log('[MS] Full payload received:', fullPayload);
   const type = fullPayload.event;  // 'team.member.added'
-  const env = 'test';  // Ou 'live' si livemode dans payload
   const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
   console.log('=== MS WEBHOOK START ===', { event: type, timestamp: fullPayload.timestamp, memberId: newMemberId, ownerId, teamId, fullPayloadKeys: Object.keys(fullPayload.payload || {}) });
 
