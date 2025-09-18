@@ -8,11 +8,12 @@
  * - Logs détaillés pour debug
  * - Fix: evtKey sur svix_id pour idempotence robuste
  * - Fix: kvSetEx au lieu de kvSet (match export kv.js)
+ * - Fix: String() coerce sur customFields values (num 1 vs '1' mismatch)
  */
 
 const fetch = require('node-fetch');
 const { Webhook } = require('svix');
-const { kvGet, kvSetEx } = require('./kv.js');  // Fix: kvSetEx importé
+const { kvGet, kvSetEx } = require('./kv.js');
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
 /* --- Utils --- */
@@ -147,7 +148,7 @@ module.exports = async (req, res) => {
     if (type === 'team.member.added') {
       if (!newMemberId || !ownerId) {
         console.log('[MS] Missing IDs', { newMemberId, ownerId });
-        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
+        await kvSetEx(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
@@ -156,26 +157,26 @@ module.exports = async (req, res) => {
         principal = await msGetMember(env, ownerId);
       } catch (e) {
         console.error('[MS] msGetMember error', { ownerId, eMessage: e.message });
-        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
+        await kvSetEx(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
       const customFields = principal.customFields || {};
       console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
 
-      const teamOwnerFlag = customFields.teamowner === '1';
-      const hasPrograms = FIELD_IDS.some(f => customFields[f] === '1');
+      const teamOwnerFlag = String(customFields.teamowner || '') === '1';  // Fix: coerce string
+      const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');  // Fix: coerce string
       if (!teamOwnerFlag || !hasPrograms) {
         console.error('[MS] Owner invalid', { ownerId, teamOwnerFlag, hasPrograms, customFieldsKeys: Object.keys(customFields) });
         console.log('[MS] Skipping copy - set teamowner=\'1\' + program flag on owner for test');
-        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
+        await kvSetEx(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
       // Copie programs + teamowner='0'
       const updates = { teamowner: '0' };
       for (const f of FIELD_IDS) {
-        updates[f] = customFields[f] || '0';
+        updates[f] = String(customFields[f] || '0');  // Fix: string pour cohérence
       }
       console.log('[MS] Updates built', updates);
       await msPatchMember(env, newMemberId, updates);
@@ -192,13 +193,13 @@ module.exports = async (req, res) => {
       console.log('[MS] Skip event', type);
     }
 
-    await kvSetEx(evtKey, 1, 30 * 24 * 3600);  // Fix: kvSetEx
+    await kvSetEx(evtKey, 1, 30 * 24 * 3600);
     console.log('=== MS WEBHOOK END (SUCCESS) ===');
     return res.status(200).send();
 
   } catch (err) {
     console.error('=== MS WEBHOOK ERROR full ===', { message: err.message, stack: err.stack });
-    await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
+    await kvSetEx(evtKey, 1, 3600);
     return res.status(500).send('Handler error');
   }
 };
