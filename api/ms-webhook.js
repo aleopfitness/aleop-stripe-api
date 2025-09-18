@@ -3,7 +3,6 @@
  * Memberstack team events → copie customFields de l'owner vers team member
  * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0' + club (nommé par owner)
  * - Event: team.member.removed → deactivate
- * - Event: member.updated → si owner et club changé, remplace club sur tous les coaches associés (team members)
  * - Svix signature vérifiée proprement (direct verify, sans createMessage)
  * - Env forcé 'test'
  * - Logs détaillés pour debug
@@ -65,48 +64,6 @@ async function msGetMember(env, memberId) {
   const fields = data.customFields || {};
   console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
   return data;
-}
-async function msGetTeamsForMember(env, memberId) {
-  const key = msApiKey(env);
-  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
-  const url = `https://admin.memberstack.com/members/${memberId}/teams`;
-  console.log('[MS] GET teams for member start', { env, memberId, keyPrefix: String(key).slice(0,6) });
-  const r = await fetch(url, { headers: msHeaders(key) });
-  const txt = await r.text();
-  console.log('[MS] GET teams response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
-  if (!r.ok) throw new Error(`MS get teams ${r.status}: ${txt}`);
-  let data;
-  try {
-    data = JSON.parse(txt || '[]');
-    data = data.data || data; // Unwrap si array wrapped
-  } catch (e) {
-    console.error('[MS] GET teams parse error', e.message, txt.substring(0,300));
-    throw e;
-  }
-  const teamIds = data.map(t => t.id || t.teamId).filter(Boolean);
-  console.log('[MS] GET teams parsed', { memberId, teamCount: teamIds.length, teamIds });
-  return teamIds[0]; // Assume 1 team ; fallback first
-}
-async function msListTeamMembers(env, teamId) {
-  const key = msApiKey(env);
-  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
-  const url = `https://admin.memberstack.com/teams/${teamId}/members`;
-  console.log('[MS] List team members start', { env, teamId, keyPrefix: String(key).slice(0,6) });
-  const r = await fetch(url, { headers: msHeaders(key) });
-  const txt = await r.text();
-  console.log('[MS] List response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
-  if (!r.ok) throw new Error(`MS list team ${r.status}: ${txt}`);
-  let data;
-  try {
-    data = JSON.parse(txt || '[]');
-    data = data.data || data; // Unwrap si array wrapped
-  } catch (e) {
-    console.error('[MS] List parse error', e.message, txt.substring(0,300));
-    throw e;
-  }
-  const members = data.map(m => m.id || m.memberId).filter(Boolean);
-  console.log('[MS] List parsed', { teamId, memberCount: members.length, memberIds: members });
-  return members;
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -186,4 +143,54 @@ module.exports = async (req, res) => {
     if (type === 'team.member.added') {
       if (!newMemberId || !ownerId) {
         console.log('[MS] Missing IDs', { newMemberId, ownerId });
-        await kvSetEx(evtKey
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+      let principal;
+      try {
+        principal = await msGetMember(env, ownerId);
+      } catch (e) {
+        console.error('[MS] msGetMember error', { ownerId, eMessage: e.message });
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+      const customFields = principal.customFields || {};
+      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, club: customFields.club, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
+      const teamOwnerFlag = String(customFields.teamowner || '') === '1';
+      const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');
+      if (!teamOwnerFlag || !hasPrograms) {
+        console.error('[MS] Owner invalid', { ownerId, teamOwnerFlag, hasPrograms, customFieldsKeys: Object.keys(customFields) });
+        console.log('[MS] Skipping copy - set teamowner=\'1\' + program flag on owner for test');
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+      // Copie programs + teamowner='0' + club (nommé par owner)
+      const updates = { teamowner: '0' };
+      if (customFields.club) {
+        updates.club = String(customFields.club); // Copie le nom du club si présent
+        console.log('[MS] Club copied', { club: updates.club });
+      }
+      for (const f of FIELD_IDS) {
+        updates[f] = String(customFields[f] || '0');
+      }
+      console.log('[MS] Updates built', updates);
+      await msPatchMember(env, newMemberId, updates);
+      console.log(`[MS] Copied to new member=${newMemberId} from owner=${ownerId}`);
+    } else if (type === 'team.member.removed') {
+      console.log('[MS] Removed event', { newMemberId });
+      if (newMemberId) {
+        await msPatchMember(env, newMemberId, buildFlags([], false));
+        console.log(`[MS] Deactivated ${newMemberId}`);
+      }
+    } else {
+      console.log('[MS] Skip event', type);
+    }
+    await kvSetEx(evtKey, 1, 30 * 24 * 3600);
+    console.log('=== MS WEBHOOK END (SUCCESS) ===');
+    return res.status(200).send();
+  } catch (err) {
+    console.error('=== MS WEBHOOK ERROR full ===', { message: err.message, stack: err.stack });
+    await kvSetEx(evtKey, 1, 3600);
+    return res.status(500).send('Handler error');
+  }
+};
