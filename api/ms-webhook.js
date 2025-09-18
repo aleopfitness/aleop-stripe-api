@@ -3,13 +3,13 @@
  * Memberstack team events → copie customFields de l'owner vers team member
  * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0'
  * - Event: team.member.removed → deactivate
- * - Svix signature vérifiée proprement
+ * - Svix signature vérifiée proprement (avec createMessage)
  * - Env forcé 'test'
  * - Logs détaillés pour debug
  */
 
 const fetch = require('node-fetch');
-const { Webhook } = require('svix');  // Correct import
+const { Webhook, createMessage } = require('svix');  // Ajout createMessage
 const { kvGet, kvSet } = require('./kv.js');
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
@@ -116,9 +116,16 @@ module.exports = async (req, res) => {
   try {
     const wh = new Webhook(msWebhookSecret);
     const payload = Buffer.from(payloadStr, 'utf-8');
-    const headerPayload = svix_timestamp ? [svix_timestamp, svix_signature] : [svix_signature];
-    console.log('[MS] Svix verify start', { headerPayloadLength: headerPayload.length });
-    event = wh.verify(payload, headerPayload);
+    // Build headers object for createMessage
+    const headersObj = {
+      'svix-id': svix_id,
+      'svix-timestamp': svix_timestamp,
+      'svix-signature': svix_signature
+    };
+    console.log('[MS] Svix headers obj', headersObj);
+    const message = createMessage(payload, headersObj);  // Créé le message structuré
+    console.log('[MS] Message created OK', { messageType: typeof message });
+    event = wh.verify(message);  // Vérif sur message
     console.log('[MS] Signature verified OK', { eventType: event.type });
   } catch (e) {
     console.error('[MS] Svix verify error full', { message: e.message, stack: e.stack, headers: { svix_id, svix_timestamp, svix_signature: svix_signature ? 'PRESENT' : 'MISSING' } });
