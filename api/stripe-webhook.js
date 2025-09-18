@@ -151,7 +151,7 @@ module.exports = async (req, res) => {
   }
 
   const type = event.type;
-  console.log('Stripe webhook hit:', { type, env, livemode: event.livemode });
+  console.log('=== WEBHOOK START ===', { type, env, livemode: event.livemode, eventId: event.id });
 
   const ACTIVATE   = new Set(['checkout.session.completed','invoice.paid']);
   const DEACTIVATE = new Set(['customer.subscription.deleted']);
@@ -164,47 +164,74 @@ module.exports = async (req, res) => {
     ) || null;
     const stripeCustomerId = obj?.customer || obj?.customer_id || null;
 
+    console.log('[WEBHOOK] Extracted data:', { emailKey, stripeCustomerId, objType: obj.object });
+
     // Idempotence simple (évite double-traitement)
     const evtKey = `processed:${env}:${event.id}`;
-    if (await kvGet(evtKey)) return res.status(200).send();
+    if (await kvGet(evtKey)) {
+      console.log('[WEBHOOK] Already processed, skip');
+      return res.status(200).send();
+    }
 
     /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
+      console.log('[ACTIVATE] Starting activation flow');
       // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js)
       let ptr = null;
+      let triedPtrKeys = [];
       if (emailKey){
-        ptr = (await kvGet(`latest-intent-email:${env}:${emailKey}`))
-           || (await kvGet(`latest-intent-email:${env==='live'?'test':'live'}:${emailKey}`))
-           || (await kvGet(`latest-intent-email:default:${emailKey}`));
+        const keysToTry = [
+          `latest-intent-email:${env}:${emailKey}`,
+          `latest-intent-email:${env==='live'?'test':'live'}:${emailKey}`,
+          `latest-intent-email:default:${emailKey}`
+        ];
+        console.log('[PTR] Trying keys for email:', emailKey, keysToTry);
+        for (let k of keysToTry) {
+          triedPtrKeys.push(k);
+          const rawPtr = await kvGet(k);
+          console.log('[PTR] Checked', k, rawPtr ? 'HIT' : 'MISS');
+          if (rawPtr) {
+            try { ptr = JSON.parse(rawPtr); } catch(e) { console.error('[PTR] Parse error:', e); }
+            if (ptr) break;
+          }
+        }
       }
 
       if (!ptr){
-        console.log('[PTR] NOT FOUND for email=', emailKey);
+        console.log('[PTR] NOT FOUND after tries:', triedPtrKeys);
         // on ACK pour que Stripe retente plus tard
         return res.status(200).send();
       }
-      try{ ptr = JSON.parse(ptr); }catch{}
+      console.log('[PTR] Found:', ptr);
 
       // ptr.intentId → clé KV principale intent:${intentId}
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
-      for (let i=0;i<4;i++){
+      console.log('[INTENT] Fetching from', intentKey);
+      for (let i=0; i<6; i++){  // Augmenté à 6 retries pour latence (on affinera après)
         const raw = await kvGet(intentKey);
-        if (raw){ try{ intent = JSON.parse(raw); }catch{ intent = raw; } }
-        console.log('[INTENT] fetch', intentKey, intent ? 'HIT' : 'MISS');
+        console.log(`[INTENT] Retry ${i+1}:`, raw ? 'RAW DATA' : 'MISS');
+        if (raw){ 
+          try{ intent = JSON.parse(raw); } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
+        }
         if (intent) break;
-        await new Promise(r=>setTimeout(r, 180*(i+1)));
+        console.log(`[INTENT] Waiting 200ms before retry ${i+1}`);
+        await new Promise(r=>setTimeout(r, 200*(i+1)));
       }
       if (!intent || intent.status === 'applied'){
-        console.log('[INTENT] unusable -> skip');
+        console.log('[INTENT] unusable (null or applied):', !!intent, intent?.status);
         await kvSet(evtKey, 1, 3600); // évite spam si déjà appliqué
         return res.status(200).send();
       }
+      console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
 
       // Résoudre memberId: on privilégie l’intent (ton front le passait)
       let memberId = intent.memberId;
+      console.log('[MS] Initial memberId from intent:', memberId);
       if (!memberId && emailKey){
-        memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
+        console.log('[MS] Resolving memberId via API for', emailKey);
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(e => { console.error('[MS] Find error:', e); return null; });
+        console.log('[MS] Resolved memberId:', memberId);
       }
       if (!memberId){
         console.log('[MS] memberId not resolved -> skip');
@@ -212,6 +239,7 @@ module.exports = async (req, res) => {
       }
 
       const updates = buildFlags(intent.programs, true);
+      console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
 
       // Marque appliqué + map stripe customer -> member
@@ -220,46 +248,53 @@ module.exports = async (req, res) => {
       if (stripeCustomerId){
         await kvSet(`map:scus:${env}:${stripeCustomerId}`, { memberId, email: emailKey || intent.email || null }, 30*24*3600);
       }
-      console.log(`Applied -> member=${memberId}`);
+      console.log(`[SUCCESS] Applied -> member=${memberId}, programs=${intent.programs.join(',')}`);
+      console.log('=== WEBHOOK END (SUCCESS) ===');
       return res.status(200).send();
     }
 
     /* ========== DEACTIVATE ========== */
     if (DEACTIVATE.has(type)){
+      console.log('[DEACTIVATE] Starting deactivation');
       let memberId = null;
 
       // d’abord via mapping stripeCustomerId s'il existe
       if (stripeCustomerId){
         const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
-        if (m){ try{ memberId = JSON.parse(m)?.memberId || null; }catch{} }
+        console.log('[DEACT] Map check:', m ? 'HIT' : 'MISS');
+        if (m){ try{ memberId = JSON.parse(m)?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
       }
       // sinon par email
       if (!memberId && emailKey){
-        memberId = await msFindMemberIdByEmail(env, emailKey).catch(()=>null);
+        console.log('[DEACT] Resolving via email:', emailKey);
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(e => { console.error('[DEACT] Find error:', e); return null; });
       }
       if (!memberId){
-        console.log('[MS] memberId not found for deactivation -> skip');
+        console.log('[DEACT] memberId not found -> skip');
         return res.status(200).send();
       }
 
       await msPatchMember(env, memberId, buildFlags([], false)); // tout à 0
       await kvSet(evtKey, 1, 30*24*3600);
-      console.log(`Deactivated -> member=${memberId}`);
+      console.log(`[SUCCESS] Deactivated -> member=${memberId}`);
+      console.log('=== WEBHOOK END (DEACT) ===');
       return res.status(200).send();
     }
 
     /* ========== MAYBE (optionnel) ========== */
     if (MAYBE.has(type)){
-      // à implémenter selon ta politique (activeStatuses, etc.)
+      console.log('[MAYBE] Skipping optional update');
       return res.status(200).send();
     }
 
     // autres types → ACK
+    console.log('[OTHER] ACK non-action event');
     return res.status(200).send();
 
   }catch(err){
-    console.error('Webhook handler error:', err && err.message ? err.message : err);
+    console.error('=== WEBHOOK ERROR ===', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
+    console.log('=== WEBHOOK END (ERROR) ===');
     return res.status(500).send('Handler error');
   }
 };
