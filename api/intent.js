@@ -49,6 +49,8 @@ module.exports = async (req, res) => {
       await new Promise(r=>setTimeout(r, 200*(i+1)));
     }
 
+    console.log('[INTENT] Stored successfully:', { intentId, env: ENV, programs: programs.length, memberId });  // Nouveau log
+
     res.status(200).json({ ok:true, intentId });
   }catch(e){
     console.error('intent error:', e.message);
