@@ -2,7 +2,7 @@
  * /api/stripe-webhook.js
  * Stripe (test/live) → retrouve l'intent en KV → met à jour Memberstack customFields
  * - Compatible avec tes pointeurs { intentId, env, t } écrits par TON intent.js
- * - KV/Upstash: auto-détecte KV_REST_API_URL / KV_REST_API_TOKEN / KV_URL etc.
+ * - KV: utilise maintenant kv.js (Vercel KV) au lieu de kvCall custom
  * - Memberstack: header 'X-API-KEY' + URLs SANS '/v2'
  * - Raw body Stripe (signature)
  *
@@ -11,24 +11,13 @@
  */
 
 const Stripe = require('stripe');
+const { kvGet, kvSetEx: kvSet } = require('./kv.js');  // Import aligné sur intent/health
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
 /* --- SECRETS --- */
 const STRIPE_SECRET_KEY     = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-
-/* --- KV / Upstash: auto-detect --- */
-const KV_URL =
-  process.env.UPSTASH_REDIS_REST_URL ||
-  process.env.KV_REST_API_URL ||
-  process.env.KV_URL ||
-  process.env.REDIS_URL;
-
-const KV_TOKEN =
-  process.env.UPSTASH_REDIS_REST_TOKEN ||
-  process.env.KV_REST_API_TOKEN ||
-  process.env.KV_REST_API_READ_ONLY_TOKEN;
 
 /* --- Utils --- */
 function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
@@ -40,32 +29,6 @@ function msApiKey(env){
 }
 function msHeaders(key){
   return { 'X-API-KEY': key, 'Content-Type':'application/json' };
-}
-
-async function kvCall(cmd, args){
-  if (!KV_URL || !KV_TOKEN){
-    const miss = [
-      !KV_URL   ? 'UPSTASH_REDIS_REST_URL/KV_REST_API_URL/KV_URL/REDIS_URL' : null,
-      !KV_TOKEN ? 'UPSTASH_REDIS_REST_TOKEN/KV_REST_API_TOKEN' : null
-    ].filter(Boolean).join(' & ');
-    throw new Error('KV missing config: ' + miss);
-  }
-  const r = await fetch(KV_URL, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${KV_TOKEN}`, 'Content-Type':'application/json' },
-    body: JSON.stringify([cmd, ...args])
-  });
-  const data = await r.json().catch(()=>null);
-  if (!r.ok) throw new Error(`KV ${cmd} ${r.status}: ${JSON.stringify(data)}`);
-  return data;
-}
-async function kvGet(key){
-  const r = await kvCall('GET', [key]);
-  return (r && typeof r.result === 'string') ? r.result : null;
-}
-async function kvSet(key, val, ttlSec){
-  const v = typeof val === 'string' ? val : JSON.stringify(val);
-  return ttlSec ? kvCall('SET', [key, v, 'EX', ttlSec]) : kvCall('SET', [key, v]);
 }
 
 function buildFlags(programs, active=true){
@@ -176,7 +139,7 @@ module.exports = async (req, res) => {
     /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
       console.log('[ACTIVATE] Starting activation flow');
-      // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js)
+      // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js) – utilise kvGet importé
       let ptr = null;
       let triedPtrKeys = [];
       if (emailKey){
@@ -188,10 +151,10 @@ module.exports = async (req, res) => {
         console.log('[PTR] Trying keys for email:', emailKey, keysToTry);
         for (let k of keysToTry) {
           triedPtrKeys.push(k);
-          const rawPtr = await kvGet(k);
+          const rawPtr = await kvGet(k);  // Utilise kvGet de kv.js
           console.log('[PTR] Checked', k, rawPtr ? 'HIT' : 'MISS');
           if (rawPtr) {
-            try { ptr = JSON.parse(rawPtr); } catch(e) { console.error('[PTR] Parse error:', e); }
+            try { ptr = typeof rawPtr === 'string' ? JSON.parse(rawPtr) : rawPtr; } catch(e) { console.error('[PTR] Parse error:', e); }
             if (ptr) break;
           }
         }
@@ -208,11 +171,11 @@ module.exports = async (req, res) => {
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       console.log('[INTENT] Fetching from', intentKey);
-      for (let i=0; i<6; i++){  // Augmenté à 6 retries pour latence (on affinera après)
-        const raw = await kvGet(intentKey);
+      for (let i=0; i<3; i++){  // Réduit à 3 comme intent.js
+        const raw = await kvGet(intentKey);  // Utilise kvGet de kv.js
         console.log(`[INTENT] Retry ${i+1}:`, raw ? 'RAW DATA' : 'MISS');
         if (raw){ 
-          try{ intent = JSON.parse(raw); } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
+          try{ intent = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
         }
         if (intent) break;
         console.log(`[INTENT] Waiting 200ms before retry ${i+1}`);
@@ -220,7 +183,7 @@ module.exports = async (req, res) => {
       }
       if (!intent || intent.status === 'applied'){
         console.log('[INTENT] unusable (null or applied):', !!intent, intent?.status);
-        await kvSet(evtKey, 1, 3600); // évite spam si déjà appliqué
+        await kvSet(evtKey, 1, 3600); // Utilise kvSet de kv.js (avec TTL)
         return res.status(200).send();
       }
       console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
@@ -243,7 +206,7 @@ module.exports = async (req, res) => {
       await msPatchMember(env, memberId, updates);
 
       // Marque appliqué + map stripe customer -> member
-      await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
+      await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);  // Utilise kvSet
       await kvSet(evtKey, 1, 30*24*3600);
       if (stripeCustomerId){
         await kvSet(`map:scus:${env}:${stripeCustomerId}`, { memberId, email: emailKey || intent.email || null }, 30*24*3600);
@@ -260,9 +223,9 @@ module.exports = async (req, res) => {
 
       // d’abord via mapping stripeCustomerId s'il existe
       if (stripeCustomerId){
-        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
+        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);  // kvGet importé
         console.log('[DEACT] Map check:', m ? 'HIT' : 'MISS');
-        if (m){ try{ memberId = JSON.parse(m)?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
+        if (m){ try{ memberId = typeof m === 'string' ? JSON.parse(m)?.memberId : m?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
       }
       // sinon par email
       if (!memberId && emailKey){
