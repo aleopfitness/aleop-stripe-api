@@ -1,22 +1,19 @@
 /**
  * /api/ms-webhook.js
  * Memberstack team events → copie customFields de l'owner vers team member
- * - Event: team.member.added (acception invitation) → copie SEULEMENT programs flags + teamowner='0'
- * - Event: team.member.removed → deactivate (flags à '0')
- * - Utilise msGetMember / msPatchMember (comme stripe-webhook)
- * - Svix signature pour sécurité (MS_WEBHOOK_SECRET_TEST pour test)
- * - KV optionnel pour idempotence
- *
- * ⚠️ Next.js: export const config = { api: { bodyParser: false } };
+ * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0'
+ * - Event: team.member.removed → deactivate
+ * - Svix signature vérifiée proprement
+ * - Env forcé 'test'
  */
 
 const fetch = require('node-fetch');
-const Svix = require('svix');  // npm i svix (si pas déjà)
-const { kvGet, kvSet } = require('./kv.js');  // Pour idempotence
+const { Webhook } = require('svix');  // Correct import (Webhook constructor)
+const { kvGet, kvSet } = require('./kv.js');
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
-/* --- Utils (copiés/alignés de stripe-webhook.js) --- */
+/* --- Utils --- */
 function msApiKey(env) {
   return env === 'live'
     ? process.env.MEMBERSTACK_API_KEY_LIVE
@@ -46,13 +43,13 @@ async function msGetMember(env, memberId) {
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
   const url = `https://admin.memberstack.com/members/${memberId}`;
-  console.log('[MS] GET member', { env, memberId, keyPrefix: String(key).slice(0,6) });
+  console.log('[MS] GET member (potential bandit owner)', { env, memberId, keyPrefix: String(key).slice(0,6) });
   const r = await fetch(url, { headers: msHeaders(key) });
   const txt = await r.text();
   if (!r.ok) throw new Error(`MS get ${r.status}: ${txt}`);
   const data = JSON.parse(txt || '{}');
-  console.log('[MS] Raw response for member:', data);  // Log temp pour debug customFields
-  return data;  // { id, customFields: { ... }, ... }
+  console.log('[MS] Raw response for owner:', data.customFields || 'no fields');
+  return data;
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -66,7 +63,7 @@ async function readRawBody(req) {
 }
 function buildFlags(programs, active = true) {
   const set = new Set((programs || []).map(s => String(s).toLowerCase()));
-  const out = { teamowner: active ? '1' : '0' };  // Aligné sur ton nom 'teamowner'
+  const out = { teamowner: active ? '1' : '0' };
   for (const f of FIELD_IDS) out[f] = active && set.has(f) ? '1' : '0';
   return out;
 }
@@ -84,25 +81,24 @@ module.exports = async (req, res) => {
 
   const payloadStr = raw.toString();
   const headers = req.headers;
-  const svix_id = headers['svix-id'];
-  const svix_timestamp = headers['svix-timestamp'];
   const svix_signature = headers['svix-signature'];
+  const svix_timestamp = headers['svix-timestamp'];
 
-  // Force env 'test' comme demandé
-  const env = 'test';
-  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_TEST;  // Utilise _TEST pour test
+  const env = 'test';  // Forcé
+  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_TEST;
   if (!msWebhookSecret) {
-    console.error('MS webhook secret missing for env=test: MS_WEBHOOK_SECRET_TEST');
+    console.error('MS webhook secret missing: MS_WEBHOOK_SECRET_TEST');
     return res.status(500).send('MS_WEBHOOK_SECRET_TEST missing');
   }
-  console.log('[MS] Using webhook secret for env=test (prefix:', msWebhookSecret.slice(0,6), ')');
+  console.log('[MS] Using secret for env=test (prefix:', msWebhookSecret.slice(0,6), ')');
 
   let event;
   try {
-    const wh = new Svix(msWebhookSecret);
-    const headerPayload = svix_id ? `${svix_id} > ${svix_timestamp}` : '';
-    const body = Buffer.from(payloadStr);
-    event = wh.verify(body, svix_signature, headerPayload ? Buffer.from(headerPayload) : undefined);
+    const wh = new Webhook(msWebhookSecret);  // Correct constructor
+    const payload = Buffer.from(payloadStr, 'utf-8');
+    const headerPayload = svix_timestamp ? [svix_timestamp, svix_signature] : [svix_signature];
+    event = wh.verify(payload, headerPayload);  // Vérif avec headers/timestamp
+    console.log('[MS] Signature verified OK');
   } catch (e) {
     console.error('MS webhook signature error:', e.message);
     return res.status(400).send('Webhook signature error');
@@ -110,11 +106,11 @@ module.exports = async (req, res) => {
 
   const fullPayload = JSON.parse(payloadStr);
   console.log('[MS] Full payload received:', fullPayload);
-  const type = fullPayload.event;  // 'team.member.added'
-  const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
-  console.log('=== MS WEBHOOK START ===', { event: type, timestamp: fullPayload.timestamp, memberId: newMemberId, ownerId, teamId, fullPayloadKeys: Object.keys(fullPayload.payload || {}) });
+  const type = fullPayload.event;
+  const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};  // newMemberId = masale, ownerId = bandit
+  console.log('=== MS WEBHOOK START ===', { event: type, timestamp: fullPayload.timestamp, newMemberId, ownerId, teamId });
 
-  const evtKey = `ms-processed:${env}:${fullPayload.id || Date.now()}`;  // Idempotence
+  const evtKey = `ms-processed:${env}:${fullPayload.id || Date.now()}`;
   if (await kvGet(evtKey)) {
     console.log('[MS] Already processed, skip');
     return res.status(200).send();
@@ -123,63 +119,56 @@ module.exports = async (req, res) => {
   try {
     if (type === 'team.member.added') {
       if (!newMemberId || !ownerId) {
-        console.log('[MS] Missing memberId or ownerId -> skip');
+        console.log('[MS] Missing IDs -> skip');
         await kvSet(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
-      // Fetch owner
       let principal;
       try {
         principal = await msGetMember(env, ownerId);
       } catch (e) {
-        console.error('[MS] Failed to fetch principal:', e.message);
+        console.error('[MS] Failed fetch owner (bandit?):', e.message);
         await kvSet(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
       const customFields = principal.customFields || {};
-      console.log('[MS] Principal fetched:', { customFields, full: principal.customFields });  // Focus sur fields
+      console.log('[MS] Owner fields (bandit):', customFields);
 
-      // Check owner valide
-      const teamOwnerFlag = customFields.teamowner === '1';  // Aligné sur ton nom
+      const teamOwnerFlag = customFields.teamowner === '1';
       const hasPrograms = FIELD_IDS.some(f => customFields[f] === '1');
       if (!teamOwnerFlag || !hasPrograms) {
-        console.error('[MS] No principal or teamowner != "1" or no fields -> manual review', { ownerId, teamOwnerFlag, hasPrograms, customFields });
+        console.error('[MS] Owner invalid:', { ownerId, teamOwnerFlag, hasPrograms, customFields });
         await kvSet(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
-      // Copie SEULEMENT les programs flags de l'owner + force teamowner='0'
+      // Copie programs + teamowner='0' pour masale
       const updates = { teamowner: '0' };
       for (const f of FIELD_IDS) {
-        updates[f] = customFields[f] || '0';  // Copie valeur exacte de l'owner (string '1' ou '0')
+        updates[f] = customFields[f] || '0';
       }
       await msPatchMember(env, newMemberId, updates);
-      console.log(`[MS] Copied programs fields to team member=${newMemberId} from owner=${ownerId}, team=${teamId}`);
+      console.log(`[MS] Copied programs to masale?=${newMemberId} from bandit?=${ownerId}`);
 
     } else if (type === 'team.member.removed') {
-      console.log('[MS] Handling removal for', newMemberId);
       if (newMemberId) {
-        await msPatchMember(env, newMemberId, buildFlags([], false));  // Tout à '0' (programs + teamowner)
-        console.log(`[MS] Deactivated removed member=${newMemberId}, team=${teamId}`);
-      } else {
-        console.log('[MS] Skip removed: no memberId');
+        await msPatchMember(env, newMemberId, buildFlags([], false));
+        console.log(`[MS] Deactivated removed=${newMemberId}`);
       }
 
     } else {
-      console.log('[MS] Skip non-team event:', type);
+      console.log('[MS] Skip event:', type);
     }
 
-    await kvSet(evtKey, 1, 30 * 24 * 3600);  // Marque processed long-term
+    await kvSet(evtKey, 1, 30 * 24 * 3600);
     console.log('=== MS WEBHOOK END (SUCCESS) ===');
     return res.status(200).send();
 
   } catch (err) {
     console.error('=== MS WEBHOOK ERROR ===', err.message);
-    if (err.stack) console.error(err.stack);
-    await kvSet(evtKey, 1, 3600);  // Marque même en error pour éviter spam
-    console.log('=== MS WEBHOOK END (ERROR) ===');
+    await kvSet(evtKey, 1, 3600);
     return res.status(500).send('Handler error');
   }
 };
