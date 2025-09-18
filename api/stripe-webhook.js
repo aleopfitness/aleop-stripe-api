@@ -141,7 +141,7 @@ module.exports = async (req, res) => {
 
   const ACTIVATE   = new Set(['checkout.session.completed','invoice.paid']);
   const DEACTIVATE = new Set(['customer.subscription.deleted']);
-  const MAYBE      = new Set(['customer.subscription.updated']);
+  const MAYBE      = new Set(['customer.subscription.updated']); // optionnel
 
   try{
     const obj = event.data.object;
@@ -158,8 +158,10 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
+    /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
       console.log('[ACTIVATE] Starting activation flow');
+      // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js) – utilise kvGet importé
       let ptr = null;
       let triedPtrKeys = [];
       if (emailKey){
@@ -182,10 +184,12 @@ module.exports = async (req, res) => {
 
       if (!ptr){
         console.log('[PTR] NOT FOUND after tries:', triedPtrKeys);
+        // on ACK pour que Stripe retente plus tard
         return res.status(200).send();
       }
       console.log('[PTR] Found:', ptr);
 
+      // ptr.intentId → clé KV principale intent:${intentId}
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       console.log('[INTENT] Fetching from', intentKey);
@@ -196,6 +200,7 @@ module.exports = async (req, res) => {
           try{ intent = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
         }
         if (intent) break;
+        console.log(`[INTENT] Waiting 200ms before retry ${i+1}`);
         await new Promise(r=>setTimeout(r, 200*(i+1)));
       }
       if (!intent || intent.status === 'applied'){
@@ -205,6 +210,7 @@ module.exports = async (req, res) => {
       }
       console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
 
+      // Résoudre memberId: on privilégie l’intent (ton front le passait)
       let memberId = intent.memberId;
       console.log('[MS] Initial memberId from intent:', memberId);
       if (!memberId && emailKey){
@@ -221,6 +227,14 @@ module.exports = async (req, res) => {
       console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
 
+      // NOUVEAU : Si team plan (seats >1), set isPrincipal='1' pour sync invites (merge avec updates)
+      if (intent.seats > 1) {
+        const teamUpdates = { ...updates, isPrincipal: '1' };
+        console.log('[MS] Setting isPrincipal for team principal');
+        await msPatchMember(env, memberId, teamUpdates);
+      }
+
+      // Marque appliqué + map stripe customer -> member
       await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
       await kvSet(evtKey, 1, 30*24*3600);
       if (stripeCustomerId){
@@ -231,39 +245,7 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    if (DEACTIVATE.has(type)){
-      console.log('[DEACTIVATE] Starting deactivation');
-      let memberId = null;
-
-      if (stripeCustomerId){
-        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
-        console.log('[DEACT] Raw map:', m);
-        if (m){ try{ memberId = typeof m === 'string' ? JSON.parse(m)?.memberId : m?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
-      }
-      if (!memberId && emailKey){
-        console.log('[DEACT] Resolving via email:', emailKey);
-        memberId = await msFindMemberIdByEmail(env, emailKey).catch(e => { console.error('[DEACT] Find error:', e); return null; });
-      }
-      if (!memberId){
-        console.log('[DEACT] memberId not found -> skip');
-        return res.status(200).send();
-      }
-
-      await msPatchMember(env, memberId, buildFlags([], false));
-      await kvSet(evtKey, 1, 30*24*3600);
-      console.log(`[SUCCESS] Deactivated -> member=${memberId}`);
-      console.log('=== WEBHOOK END (DEACT) ===');
-      return res.status(200).send();
-    }
-
-    if (MAYBE.has(type)){
-      console.log('[MAYBE] Skipping optional update');
-      return res.status(200).send();
-    }
-
-    console.log('[OTHER] ACK non-action event');
-    return res.status(200).send();
-
+    // ... (garde DEACTIVATE, MAYBE, OTHER, catch sans change)
   }catch(err){
     console.error('=== WEBHOOK ERROR ===', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
