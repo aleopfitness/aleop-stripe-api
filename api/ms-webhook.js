@@ -1,8 +1,9 @@
 /**
  * /api/ms-webhook.js
  * Memberstack team events → copie customFields de l'owner vers team member
- * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0' + club (nommé par owner)
+ * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0' + club (nommé par owner) + teamid (pour propagation future)
  * - Event: team.member.removed → deactivate
+ * - Event: member.updated → si owner update club, propage à tous les members de la team (via teamid stocké)
  * - Svix signature vérifiée proprement (direct verify, sans createMessage)
  * - Env forcé 'test'
  * - Logs détaillés pour debug
@@ -64,6 +65,28 @@ async function msGetMember(env, memberId) {
   const fields = data.customFields || {};
   console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
   return data;
+}
+async function msGetTeam(env, teamId) {
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const url = `https://admin.memberstack.com/teams/${teamId}`;
+  console.log('[MS] GET TEAM start', { env, teamId, keyPrefix: String(key).slice(0,6) });
+  const r = await fetch(url, { headers: msHeaders(key) });
+  const txt = await r.text();
+  console.log('[MS] GET TEAM response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) throw new Error(`MS get team ${r.status}: ${txt}`);
+  let data;
+  try {
+    data = JSON.parse(txt || '{}');
+    data = data.data || data; // Unwrap si nécessaire
+  } catch (e) {
+    console.error('[MS] GET TEAM parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  console.log('[MS] GET TEAM parsed', { teamId, dataKeys: Object.keys(data || {}) });
+  // Assume members sont dans data.members ou data.teamMembers ; ajuste selon logs/response
+  const members = data.members || data.teamMembers || [];
+  return Array.isArray(members) ? members : [];
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -131,8 +154,14 @@ module.exports = async (req, res) => {
   const fullPayload = JSON.parse(payloadStr);
   console.log('[MS] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}), timestamp: fullPayload.timestamp, fullPayloadId: fullPayload.id });
   const type = fullPayload.event;
-  const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
-  console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId });
+  const payloadData = fullPayload.payload || {};
+  let newMemberId, ownerId, teamId, updatedMemberId;
+  if (type === 'team.member.added' || type === 'team.member.removed') {
+    ({ memberId: newMemberId, ownerId, teamId } = payloadData);
+  } else if (type === 'member.updated') {
+    updatedMemberId = payloadData.id; // Assume payload has 'id' for the updated member
+  }
+  console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId, updatedMemberId });
   const evtKey = `ms-processed:${env}:${svix_id}`;
   const processed = await kvGet(evtKey);
   if (processed) {
@@ -155,7 +184,7 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
       const customFields = principal.customFields || {};
-      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, club: customFields.club, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
+      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, club: customFields.club, teamid: customFields.teamid, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
       const teamOwnerFlag = String(customFields.teamowner || '') === '1';
       const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');
       if (!teamOwnerFlag || !hasPrograms) {
@@ -173,14 +202,60 @@ module.exports = async (req, res) => {
       for (const f of FIELD_IDS) {
         updates[f] = String(customFields[f] || '0');
       }
+      // Ajout minimal : copie teamid pour future propagation (ne casse pas l'existant)
+      updates.teamid = String(teamId);
       console.log('[MS] Updates built', updates);
       await msPatchMember(env, newMemberId, updates);
       console.log(`[MS] Copied to new member=${newMemberId} from owner=${ownerId}`);
+      // Set teamid sur l'owner s'il n'est pas déjà set (one-time)
+      if (!customFields.teamid) {
+        console.log('[MS] Setting teamid on owner (missing)');
+        await msPatchMember(env, ownerId, { teamid: String(teamId) });
+        console.log(`[MS] Set teamid=${teamId} on owner=${ownerId}`);
+      }
     } else if (type === 'team.member.removed') {
       console.log('[MS] Removed event', { newMemberId });
       if (newMemberId) {
         await msPatchMember(env, newMemberId, buildFlags([], false));
         console.log(`[MS] Deactivated ${newMemberId}`);
+      }
+    } else if (type === 'member.updated') {
+      if (!updatedMemberId) {
+        console.log('[MS] Missing updatedMemberId in payload');
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+      let updatedMember;
+      try {
+        updatedMember = await msGetMember(env, updatedMemberId);
+      } catch (e) {
+        console.error('[MS] msGetMember error for updated', { updatedMemberId, eMessage: e.message });
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+      const customFields = updatedMember.customFields || {};
+      console.log('[MS] Updated member fields', { updatedMemberId, teamowner: customFields.teamowner, club: customFields.club, teamid: customFields.teamid });
+      // Si c'est un owner et club est set, propage à la team
+      if (String(customFields.teamowner || '') === '1' && customFields.club && customFields.teamid) {
+        const teamIdStr = String(customFields.teamid);
+        const newClub = String(customFields.club);
+        console.log('[MS] Owner updated club, propagating to team', { updatedMemberId, teamid: teamIdStr, newClub });
+        const teamMembers = await msGetTeam(env, teamIdStr);
+        let updatedCount = 0;
+        for (const tm of teamMembers) {
+          const tmId = tm.id || tm.memberId; // Assume structure {id: '...'}
+          if (!tmId || tmId === updatedMemberId) continue; // Skip self/owner
+          console.log('[MS] Updating club for team member', { tmId, newClub });
+          try {
+            await msPatchMember(env, tmId, { club: newClub });
+            updatedCount++;
+          } catch (patchErr) {
+            console.error('[MS] Patch error for tm', { tmId, err: patchErr.message });
+          }
+        }
+        console.log(`[MS] Propagated club to ${updatedCount} team members`);
+      } else {
+        console.log('[MS] Skip propagation (not owner or no club/teamid)', { teamowner: customFields.teamowner, hasClub: !!customFields.club, hasTeamid: !!customFields.teamid });
       }
     } else {
       console.log('[MS] Skip event', type);
