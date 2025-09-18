@@ -11,6 +11,7 @@
  * - Fix: kvSetEx au lieu de kvSet (match export kv.js)
  * - Fix: String() coerce sur customFields values (num 1 vs '1' mismatch)
  * - Fix: Unwrap data.data pour GET response (MS wrappe single member en {data: {customFields: ...}})
+ * - Fix: Fallback GET /teams pour owner teamId dans member.updated
  */
 
 const fetch = require('node-fetch');
@@ -65,6 +66,27 @@ async function msGetMember(env, memberId) {
   const fields = data.customFields || {};
   console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
   return data;
+}
+async function msGetTeamsForMember(env, memberId) {
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const url = `https://admin.memberstack.com/members/${memberId}/teams`;
+  console.log('[MS] GET teams for member start', { env, memberId, keyPrefix: String(key).slice(0,6) });
+  const r = await fetch(url, { headers: msHeaders(key) });
+  const txt = await r.text();
+  console.log('[MS] GET teams response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) throw new Error(`MS get teams ${r.status}: ${txt}`);
+  let data;
+  try {
+    data = JSON.parse(txt || '[]');
+    data = data.data || data;  // Unwrap si array wrapped
+  } catch (e) {
+    console.error('[MS] GET teams parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  const teamIds = data.map(t => t.id || t.teamId).filter(Boolean);
+  console.log('[MS] GET teams parsed', { memberId, teamCount: teamIds.length, teamIds });
+  return teamIds[0];  // Assume 1 team par owner ; fallback first
 }
 async function msListTeamMembers(env, teamId) {
   const key = msApiKey(env);
@@ -130,163 +152,4 @@ module.exports = async (req, res) => {
   const svix_id = headers['svix-id'];
   console.log('[MS] Svix headers', { svix_id: svix_id ? svix_id.substring(0,20) + '...' : 'MISSING', svix_timestamp, svix_signature: svix_signature ? svix_signature.substring(0,50) + '...' : 'MISSING' });
 
-  const env = 'test';  // Forcé
-  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_TEST;
-  if (!msWebhookSecret) {
-    console.error('[MS] Secret missing', { env });
-    return res.status(500).send('MS_WEBHOOK_SECRET_TEST missing');
-  }
-  console.log('[MS] Using secret for env=test (prefix:', msWebhookSecret.slice(0,6), ')');
-
-  let event;
-  try {
-    const wh = new Webhook(msWebhookSecret);
-    const payload = Buffer.from(payloadStr, 'utf-8');
-    const headersObj = {
-      'svix-id': svix_id,
-      'svix-timestamp': svix_timestamp,
-      'svix-signature': svix_signature
-    };
-    console.log('[MS] Svix headers obj', headersObj);
-    event = wh.verify(payload, headersObj);
-    console.log('[MS] Signature verified OK', { eventType: event.type });
-  } catch (e) {
-    console.error('[MS] Svix verify error full', { message: e.message, stack: e.stack, headers: { svix_id, svix_timestamp, svix_signature: svix_signature ? 'PRESENT' : 'MISSING' } });
-    return res.status(400).send('Webhook signature error');
-  }
-
-  const fullPayload = JSON.parse(payloadStr);
-  console.log('[MS] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}), timestamp: fullPayload.timestamp, fullPayloadId: fullPayload.id });
-  const type = fullPayload.event;
-  const { memberId, ownerId, teamId } = fullPayload.payload || {};  // memberId pour updated, ownerId pour team events
-  console.log('=== MS WEBHOOK START ===', { event: type, memberId, ownerId, teamId });
-
-  const evtKey = `ms-processed:${env}:${svix_id}`;
-  const processed = await kvGet(evtKey);
-  if (processed) {
-    console.log('[MS] Already processed (KV value:', processed, '), skip');
-    return res.status(200).send();
-  }
-
-  try {
-    if (type === 'team.member.added') {
-      const newMemberId = memberId;
-      if (!newMemberId || !ownerId) {
-        console.log('[MS] Missing IDs', { newMemberId, ownerId });
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      let principal;
-      try {
-        principal = await msGetMember(env, ownerId);
-      } catch (e) {
-        console.error('[MS] msGetMember error', { ownerId, eMessage: e.message });
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      const customFields = principal.customFields || {};
-      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, club: customFields.club, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
-
-      const teamOwnerFlag = String(customFields.teamowner || '') === '1';
-      const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');
-      if (!teamOwnerFlag || !hasPrograms) {
-        console.error('[MS] Owner invalid', { ownerId, teamOwnerFlag, hasPrograms, customFieldsKeys: Object.keys(customFields) });
-        console.log('[MS] Skipping copy - set teamowner=\'1\' + program flag on owner for test');
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      // Copie programs + teamowner='0' + club (nommé par owner)
-      const updates = { teamowner: '0' };
-      if (customFields.club) {
-        updates.club = String(customFields.club);  // Copie le nom du club si présent
-        console.log('[MS] Club copied', { club: updates.club });
-      }
-      for (const f of FIELD_IDS) {
-        updates[f] = String(customFields[f] || '0');
-      }
-      console.log('[MS] Updates built', updates);
-      await msPatchMember(env, newMemberId, updates);
-      console.log(`[MS] Copied to new member=${newMemberId} from owner=${ownerId}`);
-
-    } else if (type === 'team.member.removed') {
-      console.log('[MS] Removed event', { memberId });
-      if (memberId) {
-        await msPatchMember(env, memberId, buildFlags([], false));
-        console.log(`[MS] Deactivated ${memberId}`);
-      }
-
-    } else if (type === 'member.updated') {
-      console.log('[MS] Updated event', { memberId });
-      if (!memberId) {
-        console.log('[MS] Missing memberId for update');
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      let updatedMember;
-      try {
-        updatedMember = await msGetMember(env, memberId);
-      } catch (e) {
-        console.error('[MS] msGetMember error for update', { memberId, eMessage: e.message });
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      const customFields = updatedMember.customFields || {};
-      const teamOwnerFlag = String(customFields.teamowner || '') === '1';
-      if (!teamOwnerFlag) {
-        console.log('[MS] Skip update - not owner', { memberId, teamowner: customFields.teamowner });
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      // Cherche teamId de l'owner (assume dans customFields ou GET extra ; ici fallback simple via GET)
-      const ownerTeamId = updatedMember.teamId || teamId;  // Si pas, ajouter GET /teams pour owner
-      if (!ownerTeamId) {
-        console.error('[MS] No teamId for owner update', { memberId });
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      // Liste members du team (exclut owner)
-      const teamMembers = await msListTeamMembers(env, ownerTeamId);
-      const memberIds = teamMembers.filter(id => id !== memberId);  // Exclut self
-      if (memberIds.length === 0) {
-        console.log('[MS] No members to update');
-        await kvSetEx(evtKey, 1, 3600);
-        return res.status(200).send();
-      }
-
-      // Si club présent, propage
-      if (customFields.club) {
-        const clubUpdate = { club: String(customFields.club) };
-        console.log('[MS] Propagating club update', { club: clubUpdate.club, toMembers: memberIds.length });
-        for (const mid of memberIds) {
-          try {
-            await msPatchMember(env, mid, clubUpdate);
-          } catch (patchErr) {
-            console.error('[MS] Patch error on propagation', { mid, err: patchErr.message });
-          }
-        }
-        console.log(`[MS] Club propagated to ${memberIds.length} members`);
-      } else {
-        console.log('[MS] No club to propagate on update');
-      }
-
-    } else {
-      console.log('[MS] Skip event', type);
-    }
-
-    await kvSetEx(evtKey, 1, 30 * 24 * 3600);
-    console.log('=== MS WEBHOOK END (SUCCESS) ===');
-    return res.status(200).send();
-
-  } catch (err) {
-    console.error('=== MS WEBHOOK ERROR full ===', { message: err.message, stack: err.stack });
-    await kvSetEx(evtKey, 1, 3600);
-    return res.status(500).send('Handler error');
-  }
-};
+  const env = 'test';  // For
