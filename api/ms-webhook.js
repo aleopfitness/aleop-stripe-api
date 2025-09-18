@@ -2,7 +2,7 @@
  * /api/ms-webhook.js
  * Memberstack webhook → sur team.member.added (invite coach acceptée), copy customFields du principal (fetch live MS)
  * - payload.memberId = new coach, payload.ownerId = principal direct
- * - Fetch principal fields, copy to new (sans isPrincipal)
+ * - Fetch principal fields, copy to new (sans teamowner)
  * - Test mode : ?test=1&newMemberId=mem_...&ownerId=mem_... pour simuler
  * - Setup : MS dashboard > Webhooks > Add /api/ms-webhook, event team.member.added
  */
@@ -64,7 +64,7 @@ async function testSync(req) {
   const principal = await msGetMember(ENV, ownerId);
   if (!principal || !principal.customFields) return { ok: false, error: 'Principal not found or no fields' };
   const fieldsToCopy = { ...principal.customFields };
-  delete fieldsToCopy.isPrincipal;
+  delete fieldsToCopy.teamowner;
   fieldsToCopy.syncedAt = Date.now().toString();
   console.log('[TEST] Fields to copy:', fieldsToCopy);
   // Simulate PATCH (no real, for test)
@@ -130,9 +130,9 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    // Copy fields sans isPrincipal
+    // Copy fields sans teamowner
     const fieldsToCopy = { ...principal.customFields };
-    delete fieldsToCopy.isPrincipal;
+    delete fieldsToCopy.teamowner;
     fieldsToCopy.syncedAt = Date.now().toString();  // For idempotence
     console.log('[MS] Fields to copy:', fieldsToCopy);
 
