@@ -1,7 +1,7 @@
 /**
  * /api/ms-webhook.js
  * Memberstack team events → copie customFields de l'owner vers team member
- * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0'
+ * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0' + club (nommé par owner)
  * - Event: team.member.removed → deactivate
  * - Svix signature vérifiée proprement (direct verify, sans createMessage)
  * - Env forcé 'test'
@@ -56,7 +56,7 @@ async function msGetMember(env, memberId) {
   let data;
   try {
     data = JSON.parse(txt || '{}');
-    data = data.data || data;  // Fix: Unwrap {data: {customFields: ...}} pour single member
+    data = data.data || data;  // Unwrap {data: {customFields: ...}} pour single member
   } catch (e) {
     console.error('[MS] GET parse error', e.message, txt.substring(0,300));
     throw e;
@@ -164,7 +164,7 @@ module.exports = async (req, res) => {
       }
 
       const customFields = principal.customFields || {};
-      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
+      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, club: customFields.club, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
 
       const teamOwnerFlag = String(customFields.teamowner || '') === '1';
       const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');
@@ -175,8 +175,12 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
 
-      // Copie programs + teamowner='0'
+      // Copie programs + teamowner='0' + club (nommé par owner)
       const updates = { teamowner: '0' };
+      if (customFields.club) {
+        updates.club = String(customFields.club);  // Copie le nom du club si présent
+        console.log('[MS] Club copied', { club: updates.club });
+      }
       for (const f of FIELD_IDS) {
         updates[f] = String(customFields[f] || '0');
       }
