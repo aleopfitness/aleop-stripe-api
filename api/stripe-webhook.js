@@ -8,21 +8,16 @@
  * - Raw body Stripe (signature)
  *
  * ⚠️ Si tu es sur Next.js (pages/api), ajoute en bas:
- *    export const config = { api: { bodyParser: false } };
+ * export const config = { api: { bodyParser: false } };
  */
-
 const Stripe = require('stripe');
-const { kvGet, kvSetEx: kvSet } = require('./kv.js');  // Import aligné
-
+const { kvGet, kvSetEx: kvSet } = require('./kv.js'); // Import aligné
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
-
 /* --- SECRETS --- */
-const STRIPE_SECRET_KEY     = process.env.STRIPE_SECRET_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-
 /* --- Utils --- */
 function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
-
 function msApiKey(env){
   return env === 'live'
     ? process.env.MEMBERSTACK_API_KEY_LIVE
@@ -31,26 +26,23 @@ function msApiKey(env){
 function msHeaders(key){
   return { 'X-API-KEY': key, 'Content-Type':'application/json' };
 }
-
 function buildFlags(programs, active=true){
   const set = new Set((programs||[]).map(s => String(s).toLowerCase()));
   const out = {};
   for (const f of FIELD_IDS) out[f] = active && set.has(f) ? '1' : '0';
   return out;
 }
-
 /* --- Stripe raw body --- */
 async function readRawBody(req){
   return new Promise((resolve, reject) => {
     try{
       const chunks = [];
       req.on('data', c => chunks.push(Buffer.from(c)));
-      req.on('end',  () => resolve(Buffer.concat(chunks)));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
       req.on('error', reject);
     }catch(err){ reject(err); }
   });
 }
-
 /* --- Memberstack Admin REST --- */
 async function msFindMemberIdByEmail(env, email){
   const key = msApiKey(env);
@@ -67,7 +59,6 @@ async function msFindMemberIdByEmail(env, email){
   const id = d?.data?.[0]?.id ?? d?.id ?? null;
   return id || null;
 }
-
 async function msPatchMember(env, memberId, customFields){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
@@ -85,7 +76,6 @@ async function msPatchMember(env, memberId, customFields){
   }
   console.log('[MS] PATCH OK', { status: r.status });
 }
-
 /* --- Test Mode (debug KV sans Stripe) --- */
 async function testKvGet(req) {
   const url = new URL(req.url, 'http://x');
@@ -101,7 +91,6 @@ async function testKvGet(req) {
   console.log('[TEST] Parsed:', parsed);
   return { ok: true, raw, parsed };
 }
-
 /* --- Handler --- */
 module.exports = async (req, res) => {
   // Test mode d'abord (prioritaire, pas besoin raw body)
@@ -110,21 +99,17 @@ module.exports = async (req, res) => {
     const result = await testKvGet(req);
     return res.status(result.ok ? 200 : 400).json(result);
   }
-
   // CORS
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Stripe-Signature');
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST')   return res.status(405).send('Method Not Allowed');
-
-  if (!STRIPE_SECRET_KEY)     return res.status(500).send('STRIPE_SECRET_KEY missing');
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  if (!STRIPE_SECRET_KEY) return res.status(500).send('STRIPE_SECRET_KEY missing');
   if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send('STRIPE_WEBHOOK_SECRET missing');
-
   let raw;
   try{ raw = await readRawBody(req); }
   catch(e){ console.error('readRawBody error', e); return res.status(400).send('Invalid body'); }
-
   const sig = req.headers['stripe-signature'] || '';
   let event, env;
   try{
@@ -135,29 +120,23 @@ module.exports = async (req, res) => {
     console.error('Stripe constructEvent error:', e && e.message ? e.message : e);
     return res.status(400).send('Webhook signature error');
   }
-
   const type = event.type;
   console.log('=== WEBHOOK START ===', { type, env, livemode: event.livemode, eventId: event.id });
-
-  const ACTIVATE   = new Set(['checkout.session.completed','invoice.paid']);
+  const ACTIVATE = new Set(['checkout.session.completed','invoice.paid']);
   const DEACTIVATE = new Set(['customer.subscription.deleted']);
-  const MAYBE      = new Set(['customer.subscription.updated']); // optionnel
-
+  const MAYBE = new Set(['customer.subscription.updated']); // optionnel
   try{
     const obj = event.data.object;
     const emailKey = normalizeEmail(
       obj?.customer_details?.email || obj?.customer_email || ''
     ) || null;
     const stripeCustomerId = obj?.customer || obj?.customer_id || null;
-
     console.log('[WEBHOOK] Extracted data:', { emailKey, stripeCustomerId, objType: obj.object });
-
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) {
       console.log('[WEBHOOK] Already processed, skip');
       return res.status(200).send();
     }
-
     /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
       console.log('[ACTIVATE] Starting activation flow');
@@ -174,29 +153,27 @@ module.exports = async (req, res) => {
         for (let k of keysToTry) {
           triedPtrKeys.push(k);
           const rawPtr = await kvGet(k);
-          console.log('[PTR] Raw from kvGet for', k, ':', rawPtr, '(type:', typeof rawPtr, ')');  // Log raw
+          console.log('[PTR] Raw from kvGet for', k, ':', rawPtr, '(type:', typeof rawPtr, ')'); // Log raw
           if (rawPtr) {
             try { ptr = typeof rawPtr === 'string' ? JSON.parse(rawPtr) : rawPtr; } catch(e) { console.error('[PTR] Parse error:', e); }
             if (ptr) break;
           }
         }
       }
-
       if (!ptr){
         console.log('[PTR] NOT FOUND after tries:', triedPtrKeys);
         // on ACK pour que Stripe retente plus tard
         return res.status(200).send();
       }
       console.log('[PTR] Found:', ptr);
-
       // ptr.intentId → clé KV principale intent:${intentId}
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       console.log('[INTENT] Fetching from', intentKey);
       for (let i=0; i<3; i++){
         const raw = await kvGet(intentKey);
-        console.log(`[INTENT] Raw from kvGet retry ${i+1}:`, raw, '(type:', typeof raw, ')');  // Log raw détaillé
-        if (raw){ 
+        console.log(`[INTENT] Raw from kvGet retry ${i+1}:`, raw, '(type:', typeof raw, ')'); // Log raw détaillé
+        if (raw){
           try{ intent = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
         }
         if (intent) break;
@@ -209,7 +186,6 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
       console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
-
       // Résoudre memberId: on privilégie l’intent (ton front le passait)
       let memberId = intent.memberId;
       console.log('[MS] Initial memberId from intent:', memberId);
@@ -222,18 +198,15 @@ module.exports = async (req, res) => {
         console.log('[MS] memberId not resolved -> skip');
         return res.status(200).send();
       }
-
       const updates = buildFlags(intent.programs, true);
       console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
-
-      // NOUVEAU : Si team plan (seats >1), set isPrincipal='1' pour sync invites (merge avec updates)
+      // NOUVEAU : Si team plan (seats >1), set teamowner='1' pour sync invites (merge avec updates)
       if (intent.seats > 1) {
-        const teamUpdates = { ...updates, isPrincipal: '1' };
-        console.log('[MS] Setting isPrincipal for team principal');
+        const teamUpdates = { ...updates, teamowner: '1' };
+        console.log('[MS] Setting teamowner for team principal');
         await msPatchMember(env, memberId, teamUpdates);
       }
-
       // Marque appliqué + map stripe customer -> member
       await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
       await kvSet(evtKey, 1, 30*24*3600);
@@ -244,8 +217,35 @@ module.exports = async (req, res) => {
       console.log('=== WEBHOOK END (SUCCESS) ===');
       return res.status(200).send();
     }
-
-    // ... (garde DEACTIVATE, MAYBE, OTHER, catch sans change)
+    /* ========== DEACTIVATE ========== */
+    if (DEACTIVATE.has(type)){
+      console.log('[DEACTIVATE] Starting deactivation');
+      let memberId = null;
+      if (stripeCustomerId){
+        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
+        console.log('[DEACT] Raw map:', m);
+        if (m){ try{ memberId = typeof m === 'string' ? JSON.parse(m)?.memberId : m?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
+      }
+      if (!memberId && emailKey){
+        console.log('[DEACT] Resolving via email:', emailKey);
+        memberId = await msFindMemberIdByEmail(env, emailKey).catch(e => { console.error('[DEACT] Find error:', e); return null; });
+      }
+      if (!memberId){
+        console.log('[DEACT] memberId not found -> skip');
+        return res.status(200).send();
+      }
+      await msPatchMember(env, memberId, buildFlags([], false));
+      await kvSet(evtKey, 1, 30*24*3600);
+      console.log(`[SUCCESS] Deactivated -> member=${memberId}`);
+      console.log('=== WEBHOOK END (DEACT) ===');
+      return res.status(200).send();
+    }
+    if (MAYBE.has(type)){
+      console.log('[MAYBE] Skipping optional update');
+      return res.status(200).send();
+    }
+    console.log('[OTHER] ACK non-action event');
+    return res.status(200).send();
   }catch(err){
     console.error('=== WEBHOOK ERROR ===', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
