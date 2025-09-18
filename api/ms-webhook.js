@@ -7,12 +7,12 @@
  * - Env forcé 'test'
  * - Logs détaillés pour debug
  * - Fix: evtKey sur svix_id pour idempotence robuste
+ * - Fix: kvSetEx au lieu de kvSet (match export kv.js)
  */
 
 const fetch = require('node-fetch');
-const { Webhook } = require('svix');  // Retiré createMessage (inutile/cassé)
-const { kvGet, kvSet } = require('./kv.js');
-
+const { Webhook } = require('svix');
+const { kvGet, kvSetEx } = require('./kv.js');  // Fix: kvSetEx importé
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
 /* --- Utils --- */
@@ -99,7 +99,7 @@ module.exports = async (req, res) => {
 
   const payloadStr = raw.toString();
   const headers = req.headers;
-  console.log('[MS] All headers received', { headers: Object.keys(headers).map(k => ({ k, v: String(headers[k]).substring(0,50) + '...' })) });  // Log tous headers
+  console.log('[MS] All headers received', { headers: Object.keys(headers).map(k => ({ k, v: String(headers[k]).substring(0,50) + '...' })) });
   const svix_signature = headers['svix-signature'];
   const svix_timestamp = headers['svix-timestamp'];
   const svix_id = headers['svix-id'];
@@ -117,14 +117,13 @@ module.exports = async (req, res) => {
   try {
     const wh = new Webhook(msWebhookSecret);
     const payload = Buffer.from(payloadStr, 'utf-8');
-    // Headers obj direct pour verify (standard Svix API)
     const headersObj = {
       'svix-id': svix_id,
       'svix-timestamp': svix_timestamp,
       'svix-signature': svix_signature
     };
     console.log('[MS] Svix headers obj', headersObj);
-    event = wh.verify(payload, headersObj);  // Direct verify (fix: sans createMessage)
+    event = wh.verify(payload, headersObj);
     console.log('[MS] Signature verified OK', { eventType: event.type });
   } catch (e) {
     console.error('[MS] Svix verify error full', { message: e.message, stack: e.stack, headers: { svix_id, svix_timestamp, svix_signature: svix_signature ? 'PRESENT' : 'MISSING' } });
@@ -137,7 +136,6 @@ module.exports = async (req, res) => {
   const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
   console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId });
 
-  // Fix: evtKey sur svix_id pour idempotence (plus robuste que fullPayload.id)
   const evtKey = `ms-processed:${env}:${svix_id}`;
   const processed = await kvGet(evtKey);
   if (processed) {
@@ -149,7 +147,7 @@ module.exports = async (req, res) => {
     if (type === 'team.member.added') {
       if (!newMemberId || !ownerId) {
         console.log('[MS] Missing IDs', { newMemberId, ownerId });
-        await kvSet(evtKey, 1, 3600);
+        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
         return res.status(200).send();
       }
 
@@ -158,7 +156,7 @@ module.exports = async (req, res) => {
         principal = await msGetMember(env, ownerId);
       } catch (e) {
         console.error('[MS] msGetMember error', { ownerId, eMessage: e.message });
-        await kvSet(evtKey, 1, 3600);
+        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
         return res.status(200).send();
       }
 
@@ -169,7 +167,8 @@ module.exports = async (req, res) => {
       const hasPrograms = FIELD_IDS.some(f => customFields[f] === '1');
       if (!teamOwnerFlag || !hasPrograms) {
         console.error('[MS] Owner invalid', { ownerId, teamOwnerFlag, hasPrograms, customFieldsKeys: Object.keys(customFields) });
-        await kvSet(evtKey, 1, 3600);
+        console.log('[MS] Skipping copy - set teamowner=\'1\' + program flag on owner for test');
+        await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
         return res.status(200).send();
       }
 
@@ -193,19 +192,13 @@ module.exports = async (req, res) => {
       console.log('[MS] Skip event', type);
     }
 
-    await kvSet(evtKey, 1, 30 * 24 * 3600);
+    await kvSetEx(evtKey, 1, 30 * 24 * 3600);  // Fix: kvSetEx
     console.log('=== MS WEBHOOK END (SUCCESS) ===');
     return res.status(200).send();
 
   } catch (err) {
     console.error('=== MS WEBHOOK ERROR full ===', { message: err.message, stack: err.stack });
-    await kvSet(evtKey, 1, 3600);
+    await kvSetEx(evtKey, 1, 3600);  // Fix: kvSetEx
     return res.status(500).send('Handler error');
   }
 };
-
-/*
-export const config = {
-  api: { bodyParser: false }
-};
-*/
