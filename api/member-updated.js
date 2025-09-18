@@ -3,7 +3,7 @@
  * Dédié à member.updated → propage club de teamowner à la team
  * - Résout ID via email si manquant
  * - Check teamowner='1' + club + teamid
- * - Propagé via GET /teams/{teamid} + PATCH club sur members (sauf self)
+ * - Propagé via list all members + filter by teamid (fix 404 on /teams/{id})
  * - Svix + KV idempotence
  * - Env 'test'
  */
@@ -84,26 +84,27 @@ async function msFindMemberIdByEmail(env, email){
   console.log('[MS-UPDATED] findByEmail resolved id', { id });
   return id || null;
 }
-async function msGetTeam(env, teamId) {
+async function msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId) {
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
-  const url = `https://admin.memberstack.com/teams/${teamId}`;
-  console.log('[MS-UPDATED] GET TEAM start', { env, teamId, keyPrefix: String(key).slice(0,6) });
+  const url = `https://admin.memberstack.com/members`; // List all members (assume <1000, no pagination for simplicity)
+  console.log('[MS-UPDATED] GET ALL MEMBERS start', { env, teamIdStr, keyPrefix: String(key).slice(0,6) });
   const r = await fetch(url, { headers: msHeaders(key) });
   const txt = await r.text();
-  console.log('[MS-UPDATED] GET TEAM response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
-  if (!r.ok) throw new Error(`MS get team ${r.status}: ${txt}`);
+  console.log('[MS-UPDATED] GET ALL MEMBERS response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) throw new Error(`MS get members ${r.status}: ${txt}`);
   let data;
   try {
     data = JSON.parse(txt || '{}');
     data = data.data || data; // Unwrap
   } catch (e) {
-    console.error('[MS-UPDATED] GET TEAM parse error', e.message, txt.substring(0,300));
+    console.error('[MS-UPDATED] GET ALL MEMBERS parse error', e.message, txt.substring(0,300));
     throw e;
   }
-  console.log('[MS-UPDATED] GET TEAM parsed', { teamId, dataKeys: Object.keys(data || {}) });
-  const members = data.members || data.teamMembers || data.users || []; // Plus robuste, teste selon logs
-  return Array.isArray(members) ? members : [];
+  console.log('[MS-UPDATED] GET ALL MEMBERS parsed', { totalMembers: (data || []).length });
+  const teamMembers = (Array.isArray(data) ? data : []).filter(m => String(m.customFields?.teamid || '') === teamIdStr && m.id !== updatedMemberId);
+  console.log('[MS-UPDATED] Filtered team members', { count: teamMembers.length, teamIdStr });
+  return teamMembers;
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -202,11 +203,10 @@ module.exports = async (req, res) => {
       const teamIdStr = String(customFields.teamid);
       const newClub = String(customFields.club);
       console.log('[MS-UPDATED] Owner updated club, propagating', { updatedMemberId, teamid: teamIdStr, newClub });
-      const teamMembers = await msGetTeam(env, teamIdStr);
+      const teamMembers = await msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId);
       let updatedCount = 0;
       for (const tm of teamMembers) {
-        const tmId = tm.id || tm.memberId;
-        if (!tmId || tmId === updatedMemberId) continue; // Skip self
+        const tmId = tm.id;
         console.log('[MS-UPDATED] Updating club for member', { tmId, newClub });
         try {
           await msPatchMember(env, tmId, { club: newClub });
