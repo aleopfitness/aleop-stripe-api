@@ -2,7 +2,8 @@
  * /api/stripe-webhook.js
  * Stripe (test/live) → retrouve l'intent en KV → met à jour Memberstack customFields
  * - Compatible avec tes pointeurs { intentId, env, t } écrits par TON intent.js
- * - KV: utilise maintenant kv.js (Vercel KV) au lieu de kvCall custom
+ * - KV: utilise kv.js (Vercel KV) avec logs
+ * - Test mode: ?test=1&key=XXX pour debug kvGet isolé
  * - Memberstack: header 'X-API-KEY' + URLs SANS '/v2'
  * - Raw body Stripe (signature)
  *
@@ -11,7 +12,7 @@
  */
 
 const Stripe = require('stripe');
-const { kvGet, kvSetEx: kvSet } = require('./kv.js');  // Import aligné sur intent/health
+const { kvGet, kvSetEx: kvSet } = require('./kv.js');  // Import aligné
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 
@@ -85,9 +86,32 @@ async function msPatchMember(env, memberId, customFields){
   console.log('[MS] PATCH OK', { status: r.status });
 }
 
+/* --- Test Mode (debug KV sans Stripe) --- */
+async function testKvGet(req) {
+  const url = new URL(req.url, 'http://x');
+  const testKey = url.searchParams.get('key');
+  if (!testKey) return { ok: false, error: 'Missing ?key=XXX' };
+  console.log('[TEST] Starting KV test for key:', testKey);
+  const raw = await kvGet(testKey);
+  console.log('[TEST] Raw kvGet result:', raw, '(type:', typeof raw, ')');
+  let parsed = null;
+  if (raw) {
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[TEST] Parse error:', e); }
+  }
+  console.log('[TEST] Parsed:', parsed);
+  return { ok: true, raw, parsed };
+}
+
 /* --- Handler --- */
 module.exports = async (req, res) => {
-  // CORS (Stripe s’en fout, mais ça ne gêne pas)
+  // Test mode d'abord (prioritaire, pas besoin raw body)
+  const url = new URL(req.url, 'http://x');
+  if (url.searchParams.get('test') === '1') {
+    const result = await testKvGet(req);
+    return res.status(result.ok ? 200 : 400).json(result);
+  }
+
+  // CORS
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Stripe-Signature');
@@ -97,7 +121,6 @@ module.exports = async (req, res) => {
   if (!STRIPE_SECRET_KEY)     return res.status(500).send('STRIPE_SECRET_KEY missing');
   if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send('STRIPE_WEBHOOK_SECRET missing');
 
-  // Stripe a besoin du raw body
   let raw;
   try{ raw = await readRawBody(req); }
   catch(e){ console.error('readRawBody error', e); return res.status(400).send('Invalid body'); }
@@ -118,7 +141,7 @@ module.exports = async (req, res) => {
 
   const ACTIVATE   = new Set(['checkout.session.completed','invoice.paid']);
   const DEACTIVATE = new Set(['customer.subscription.deleted']);
-  const MAYBE      = new Set(['customer.subscription.updated']); // optionnel
+  const MAYBE      = new Set(['customer.subscription.updated']);
 
   try{
     const obj = event.data.object;
@@ -129,17 +152,14 @@ module.exports = async (req, res) => {
 
     console.log('[WEBHOOK] Extracted data:', { emailKey, stripeCustomerId, objType: obj.object });
 
-    // Idempotence simple (évite double-traitement)
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) {
       console.log('[WEBHOOK] Already processed, skip');
       return res.status(200).send();
     }
 
-    /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
       console.log('[ACTIVATE] Starting activation flow');
-      // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js) – utilise kvGet importé
       let ptr = null;
       let triedPtrKeys = [];
       if (emailKey){
@@ -151,8 +171,8 @@ module.exports = async (req, res) => {
         console.log('[PTR] Trying keys for email:', emailKey, keysToTry);
         for (let k of keysToTry) {
           triedPtrKeys.push(k);
-          const rawPtr = await kvGet(k);  // Utilise kvGet de kv.js
-          console.log('[PTR] Checked', k, rawPtr ? 'HIT' : 'MISS');
+          const rawPtr = await kvGet(k);
+          console.log('[PTR] Raw from kvGet for', k, ':', rawPtr, '(type:', typeof rawPtr, ')');  // Log raw
           if (rawPtr) {
             try { ptr = typeof rawPtr === 'string' ? JSON.parse(rawPtr) : rawPtr; } catch(e) { console.error('[PTR] Parse error:', e); }
             if (ptr) break;
@@ -162,33 +182,29 @@ module.exports = async (req, res) => {
 
       if (!ptr){
         console.log('[PTR] NOT FOUND after tries:', triedPtrKeys);
-        // on ACK pour que Stripe retente plus tard
         return res.status(200).send();
       }
       console.log('[PTR] Found:', ptr);
 
-      // ptr.intentId → clé KV principale intent:${intentId}
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       console.log('[INTENT] Fetching from', intentKey);
-      for (let i=0; i<3; i++){  // Réduit à 3 comme intent.js
-        const raw = await kvGet(intentKey);  // Utilise kvGet de kv.js
-        console.log(`[INTENT] Retry ${i+1}:`, raw ? 'RAW DATA' : 'MISS');
+      for (let i=0; i<3; i++){
+        const raw = await kvGet(intentKey);
+        console.log(`[INTENT] Raw from kvGet retry ${i+1}:`, raw, '(type:', typeof raw, ')');  // Log raw détaillé
         if (raw){ 
           try{ intent = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
         }
         if (intent) break;
-        console.log(`[INTENT] Waiting 200ms before retry ${i+1}`);
         await new Promise(r=>setTimeout(r, 200*(i+1)));
       }
       if (!intent || intent.status === 'applied'){
         console.log('[INTENT] unusable (null or applied):', !!intent, intent?.status);
-        await kvSet(evtKey, 1, 3600); // Utilise kvSet de kv.js (avec TTL)
+        await kvSet(evtKey, 1, 3600);
         return res.status(200).send();
       }
       console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
 
-      // Résoudre memberId: on privilégie l’intent (ton front le passait)
       let memberId = intent.memberId;
       console.log('[MS] Initial memberId from intent:', memberId);
       if (!memberId && emailKey){
@@ -205,8 +221,7 @@ module.exports = async (req, res) => {
       console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
 
-      // Marque appliqué + map stripe customer -> member
-      await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);  // Utilise kvSet
+      await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
       await kvSet(evtKey, 1, 30*24*3600);
       if (stripeCustomerId){
         await kvSet(`map:scus:${env}:${stripeCustomerId}`, { memberId, email: emailKey || intent.email || null }, 30*24*3600);
@@ -216,18 +231,15 @@ module.exports = async (req, res) => {
       return res.status(200).send();
     }
 
-    /* ========== DEACTIVATE ========== */
     if (DEACTIVATE.has(type)){
       console.log('[DEACTIVATE] Starting deactivation');
       let memberId = null;
 
-      // d’abord via mapping stripeCustomerId s'il existe
       if (stripeCustomerId){
-        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);  // kvGet importé
-        console.log('[DEACT] Map check:', m ? 'HIT' : 'MISS');
+        const m = await kvGet(`map:scus:${env}:${stripeCustomerId}`);
+        console.log('[DEACT] Raw map:', m);
         if (m){ try{ memberId = typeof m === 'string' ? JSON.parse(m)?.memberId : m?.memberId || null; }catch(e){ console.error('[DEACT] Parse map error:', e); } }
       }
-      // sinon par email
       if (!memberId && emailKey){
         console.log('[DEACT] Resolving via email:', emailKey);
         memberId = await msFindMemberIdByEmail(env, emailKey).catch(e => { console.error('[DEACT] Find error:', e); return null; });
@@ -237,20 +249,18 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
 
-      await msPatchMember(env, memberId, buildFlags([], false)); // tout à 0
+      await msPatchMember(env, memberId, buildFlags([], false));
       await kvSet(evtKey, 1, 30*24*3600);
       console.log(`[SUCCESS] Deactivated -> member=${memberId}`);
       console.log('=== WEBHOOK END (DEACT) ===');
       return res.status(200).send();
     }
 
-    /* ========== MAYBE (optionnel) ========== */
     if (MAYBE.has(type)){
       console.log('[MAYBE] Skipping optional update');
       return res.status(200).send();
     }
 
-    // autres types → ACK
     console.log('[OTHER] ACK non-action event');
     return res.status(200).send();
 
@@ -261,10 +271,3 @@ module.exports = async (req, res) => {
     return res.status(500).send('Handler error');
   }
 };
-
-// ⚠️ Next.js (pages/api) : Stripe a besoin du raw body
-/*
-export const config = {
-  api: { bodyParser: false }
-};
-*/
