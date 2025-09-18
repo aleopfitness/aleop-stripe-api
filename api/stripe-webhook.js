@@ -26,9 +26,9 @@ function msApiKey(env){
 function msHeaders(key){
   return { 'X-API-KEY': key, 'Content-Type':'application/json' };
 }
-function buildFlags(programs, active=true){
+function buildFlags(programs, active=true, seats=0){
   const set = new Set((programs||[]).map(s => String(s).toLowerCase()));
-  const out = {};
+  const out = { teamowner: (active && seats > 1) ? '1' : '0' };
   for (const f of FIELD_IDS) out[f] = active && set.has(f) ? '1' : '0';
   return out;
 }
@@ -131,7 +131,8 @@ module.exports = async (req, res) => {
       obj?.customer_details?.email || obj?.customer_email || ''
     ) || null;
     const stripeCustomerId = obj?.customer || obj?.customer_id || null;
-    console.log('[WEBHOOK] Extracted data:', { emailKey, stripeCustomerId, objType: obj.object });
+
+    // Idempotence simple (évite double-traitement)
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) {
       console.log('[WEBHOOK] Already processed, skip');
@@ -198,15 +199,9 @@ module.exports = async (req, res) => {
         console.log('[MS] memberId not resolved -> skip');
         return res.status(200).send();
       }
-      const updates = buildFlags(intent.programs, true);
+      const updates = buildFlags(intent.programs, true, intent.seats);
       console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
-      // NOUVEAU : Si team plan (seats >1), set teamowner='1' pour sync invites (merge avec updates)
-      if (intent.seats > 1) {
-        const teamUpdates = { ...updates, teamowner: '1' };
-        console.log('[MS] Setting teamowner for team principal');
-        await msPatchMember(env, memberId, teamUpdates);
-      }
       // Marque appliqué + map stripe customer -> member
       await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
       await kvSet(evtKey, 1, 30*24*3600);
