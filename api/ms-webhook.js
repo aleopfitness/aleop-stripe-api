@@ -66,6 +66,30 @@ async function msGetMember(env, memberId) {
   console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
   return data;
 }
+async function msFindMemberIdByEmail(env, email){
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const url = `https://admin.memberstack.com/members/${encodeURIComponent(email)}`;
+  console.log('[MS] findByEmail start', { env, email, keyPrefix: String(key).slice(0,6) });
+  const r = await fetch(url, { headers: msHeaders(key) });
+  const txt = await r.text();
+  if (!r.ok){
+    if (r.status === 404) return null;
+    console.error('[MS] findByEmail ERROR', r.status, txt.substring(0,300));
+    throw new Error(`MS query ${r.status}: ${txt}`);
+  }
+  let d;
+  try {
+    d = JSON.parse(txt || '{}');
+    d = d.data || d;
+  } catch (e) {
+    console.error('[MS] findByEmail parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  const id = Array.isArray(d) ? d[0]?.id : d?.id ?? null;
+  console.log('[MS] findByEmail resolved id', { id });
+  return id || null;
+}
 async function msGetTeam(env, teamId) {
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
@@ -159,7 +183,11 @@ module.exports = async (req, res) => {
   if (type === 'team.member.added' || type === 'team.member.removed') {
     ({ memberId: newMemberId, ownerId, teamId } = payloadData);
   } else if (type === 'member.updated') {
-    updatedMemberId = payloadData.id; // Assume payload has 'id' for the updated member
+    updatedMemberId = payloadData.id; // Try direct id first
+    if (!updatedMemberId && payloadData.auth && payloadData.auth.email) {
+      console.log('[MS] No direct id in payload, resolving via email', { email: payloadData.auth.email });
+      updatedMemberId = await msFindMemberIdByEmail(env, payloadData.auth.email);
+    }
   }
   console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId, updatedMemberId });
   const evtKey = `ms-processed:${env}:${svix_id}`;
@@ -221,7 +249,7 @@ module.exports = async (req, res) => {
       }
     } else if (type === 'member.updated') {
       if (!updatedMemberId) {
-        console.log('[MS] Missing updatedMemberId in payload');
+        console.log('[MS] Missing updatedMemberId in payload and could not resolve via email');
         await kvSetEx(evtKey, 1, 3600);
         return res.status(200).send();
       }
