@@ -1,10 +1,26 @@
-// /api/ms-webhook.js
-const fetch = require('node-fetch');
-const Svix = require('svix');  // npm i svix si pas installé
+/**
+ * /api/ms-webhook.js
+ * Memberstack team events → copie customFields de l'owner vers team member
+ * - Event: team.member.added (acception invitation) → copie SEULEMENT programs flags + teamowner='0'
+ * - Event: team.member.removed → deactivate (flags à '0')
+ * - Utilise msGetMember / msPatchMember (comme stripe-webhook)
+ * - Svix signature pour sécurité
+ * - KV optionnel pour idempotence
+ *
+ * ⚠️ Next.js: export const config = { api: { bodyParser: false } };
+ */
 
-/* --- Utils (copie de stripe-webhook.js) --- */
+const fetch = require('node-fetch');
+const Svix = require('svix');  // npm i svix (si pas déjà)
+const { kvGet, kvSet } = require('./kv.js');  // Pour idempotence
+
+const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
+
+/* --- Utils (copiés/alignés de stripe-webhook.js) --- */
 function msApiKey(env) {
-  return env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
+  return env === 'live'
+    ? process.env.MEMBERSTACK_API_KEY_LIVE
+    : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
 }
 function msHeaders(key) {
   return { 'X-API-KEY': key, 'Content-Type': 'application/json' };
@@ -35,7 +51,8 @@ async function msGetMember(env, memberId) {
   const txt = await r.text();
   if (!r.ok) throw new Error(`MS get ${r.status}: ${txt}`);
   const data = JSON.parse(txt || '{}');
-  return data;  // { id, customFields, ... }
+  console.log('[MS] Raw response for member:', data);  // Log temp pour debug customFields
+  return data;  // { id, customFields: { ... }, ... }
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -47,11 +64,9 @@ async function readRawBody(req) {
     } catch (err) { reject(err); }
   });
 }
-
-const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
 function buildFlags(programs, active = true) {
   const set = new Set((programs || []).map(s => String(s).toLowerCase()));
-  const out = { team_owner: active ? '1' : '0' };  // Ajoute team_owner
+  const out = { teamowner: active ? '1' : '0' };  // Aligné sur ton nom 'teamowner'
   for (const f of FIELD_IDS) out[f] = active && set.has(f) ? '1' : '0';
   return out;
 }
@@ -67,7 +82,7 @@ module.exports = async (req, res) => {
   let raw;
   try { raw = await readRawBody(req); } catch (e) { return res.status(400).send('Invalid body'); }
 
-  const payload = raw.toString();
+  const payloadStr = raw.toString();
   const headers = req.headers;
   const svix_id = headers['svix-id'];
   const svix_timestamp = headers['svix-timestamp'];
@@ -78,59 +93,68 @@ module.exports = async (req, res) => {
     if (!process.env.MS_WEBHOOK_SECRET) throw new Error('MS_WEBHOOK_SECRET missing');
     const wh = new Svix(process.env.MS_WEBHOOK_SECRET);
     const headerPayload = svix_id ? `${svix_id} > ${svix_timestamp}` : '';
-    const body = Buffer.from(payload);
+    const body = Buffer.from(payloadStr);
     event = wh.verify(body, svix_signature, headerPayload ? Buffer.from(headerPayload) : undefined);
   } catch (e) {
     console.error('MS webhook signature error:', e.message);
     return res.status(400).send('Webhook signature error');
   }
 
-  const fullPayload = JSON.parse(payload);
+  const fullPayload = JSON.parse(payloadStr);
   console.log('[MS] Full payload received:', fullPayload);
-  const type = fullPayload.event;  // 'team.member.added' etc.
-  const env = 'test';  // Ou détecte de fullPayload si possible
+  const type = fullPayload.event;  // 'team.member.added'
+  const env = 'test';  // Ou 'live' si livemode dans payload
   const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
   console.log('=== MS WEBHOOK START ===', { event: type, timestamp: fullPayload.timestamp, memberId: newMemberId, ownerId, teamId, fullPayloadKeys: Object.keys(fullPayload.payload || {}) });
+
+  const evtKey = `ms-processed:${env}:${fullPayload.id || Date.now()}`;  // Idempotence
+  if (await kvGet(evtKey)) {
+    console.log('[MS] Already processed, skip');
+    return res.status(200).send();
+  }
 
   try {
     if (type === 'team.member.added') {
       if (!newMemberId || !ownerId) {
         console.log('[MS] Missing memberId or ownerId -> skip');
+        await kvSet(evtKey, 1, 3600);
         return res.status(200).send();
       }
 
-      // Fetch owner (principal)
+      // Fetch owner
       let principal;
       try {
         principal = await msGetMember(env, ownerId);
       } catch (e) {
         console.error('[MS] Failed to fetch principal:', e.message);
-        return res.status(200).send();  // ACK même si fail
+        await kvSet(evtKey, 1, 3600);
+        return res.status(200).send();
       }
 
       const customFields = principal.customFields || {};
-      console.log('[MS] Principal fetched:', { customFields, full: principal });  // Log full pour debug
+      console.log('[MS] Principal fetched:', { customFields, full: principal.customFields });  // Focus sur fields
 
-      // Check si owner valide (a team_owner: '1' et programs)
-      const teamOwnerFlag = customFields.team_owner === '1';
-      const hasPrograms = Object.keys(customFields).some(f => FIELD_IDS.includes(f) && customFields[f] === '1');
+      // Check owner valide
+      const teamOwnerFlag = customFields.teamowner === '1';  // Aligné sur ton nom
+      const hasPrograms = FIELD_IDS.some(f => customFields[f] === '1');
       if (!teamOwnerFlag || !hasPrograms) {
-        console.error('[MS] No principal or teamowner != "1" or no fields -> manual review', { ownerId, teamOwnerFlag, hasPrograms });
-        return res.status(200).send();  // Skip mais log pour review
+        console.error('[MS] No principal or teamowner != "1" or no fields -> manual review', { ownerId, teamOwnerFlag, hasPrograms, customFields });
+        await kvSet(evtKey, 1, 3600);
+        return res.status(200).send();
       }
 
-      // Copie les programs flags (garde team_owner='0' pour new member)
-      const updates = { ...customFields };
-      delete updates.team_owner;  // Enlève pour new member
-      updates.team_owner = '0';  // Ou juste set à 0 si pas présent
-
+      // Copie SEULEMENT les programs flags de l'owner + force teamowner='0'
+      const updates = { teamowner: '0' };
+      for (const f of FIELD_IDS) {
+        updates[f] = customFields[f] || '0';  // Copie valeur exacte de l'owner (string '1' ou '0')
+      }
       await msPatchMember(env, newMemberId, updates);
-      console.log(`[MS] Copied fields to team member=${newMemberId} from owner=${ownerId}, team=${teamId}`);
+      console.log(`[MS] Copied programs fields to team member=${newMemberId} from owner=${ownerId}, team=${teamId}`);
 
     } else if (type === 'team.member.removed') {
-      // Optionnel : Deactivate (set flags à 0)
+      console.log('[MS] Handling removal for', newMemberId);
       if (newMemberId) {
-        await msPatchMember(env, newMemberId, buildFlags([], false));  // Tout à 0
+        await msPatchMember(env, newMemberId, buildFlags([], false));  // Tout à '0' (programs + teamowner)
         console.log(`[MS] Deactivated removed member=${newMemberId}, team=${teamId}`);
       } else {
         console.log('[MS] Skip removed: no memberId');
@@ -140,15 +164,21 @@ module.exports = async (req, res) => {
       console.log('[MS] Skip non-team event:', type);
     }
 
+    await kvSet(evtKey, 1, 30 * 24 * 3600);  // Marque processed long-term
+    console.log('=== MS WEBHOOK END (SUCCESS) ===');
     return res.status(200).send();
 
   } catch (err) {
-    console.error('MS webhook handler error:', err.message);
+    console.error('=== MS WEBHOOK ERROR ===', err.message);
     if (err.stack) console.error(err.stack);
+    await kvSet(evtKey, 1, 3600);  // Marque même en error pour éviter spam
+    console.log('=== MS WEBHOOK END (ERROR) ===');
     return res.status(500).send('Handler error');
   }
 };
 
 /*
-export const config = { api: { bodyParser: false } };  // Si Next.js
+export const config = {
+  api: { bodyParser: false }
+};
 */
