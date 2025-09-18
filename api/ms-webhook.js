@@ -116,10 +116,10 @@ module.exports = async (req, res) => {
   try {
     // Fetch principal
     const principal = await msGetMember(ENV, ownerId);
-    console.log('[MS] Principal fetched:', principal ? principal.id : 'MISS', 'fields:', principal?.customFields);
+    console.log('[MS] Principal fetched:', principal ? principal.id : 'MISS', 'customFields full:', principal?.customFields);  // Log full for debug
 
-    if (!principal || !principal.customFields) {
-      console.error('[MS] No principal found or no fields -> manual review');
+    if (!principal || !principal.customFields || principal.customFields.teamowner !== '1') {
+      console.error('[MS] No principal or teamowner != "1" or no fields -> manual review');
       return res.status(200).send();
     }
 
