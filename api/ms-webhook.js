@@ -9,6 +9,7 @@
  * - Fix: evtKey sur svix_id pour idempotence robuste
  * - Fix: kvSetEx au lieu de kvSet (match export kv.js)
  * - Fix: String() coerce sur customFields values (num 1 vs '1' mismatch)
+ * - Debug: Logs extra raw types/full fields pour traquer zeros
  */
 
 const fetch = require('node-fetch');
@@ -60,7 +61,7 @@ async function msGetMember(env, memberId) {
     throw e;
   }
   const fields = data.customFields || {};
-  console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
+  console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields, fieldsTypes: Object.fromEntries(Object.entries(fields).map(([k,v]) => [k, typeof v])) });  // Debug: types
   return data;
 }
 async function readRawBody(req) {
@@ -162,10 +163,11 @@ module.exports = async (req, res) => {
       }
 
       const customFields = principal.customFields || {};
-      console.log('[MS] Owner fields detailed', { ownerId, teamowner: customFields.teamowner, programs: FIELD_IDS.map(f => ({ f, value: customFields[f] })) });
+      console.log('[MS] Owner fields detailed RAW', { ownerId, fullCustomFields: customFields, teamownerRaw: customFields.teamowner, programsRaw: FIELD_IDS.reduce((acc, f) => ({...acc, [f]: customFields[f]}), {}) });  // Debug: full raw dump
 
-      const teamOwnerFlag = String(customFields.teamowner || '') === '1';  // Fix: coerce string
-      const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');  // Fix: coerce string
+      const teamOwnerFlag = String(customFields.teamowner || '') === '1';
+      const hasPrograms = FIELD_IDS.some(f => String(customFields[f] || '') === '1');
+      console.log('[MS] Validation flags', { teamOwnerFlag, hasPrograms });  // Debug: après coerce
       if (!teamOwnerFlag || !hasPrograms) {
         console.error('[MS] Owner invalid', { ownerId, teamOwnerFlag, hasPrograms, customFieldsKeys: Object.keys(customFields) });
         console.log('[MS] Skipping copy - set teamowner=\'1\' + program flag on owner for test');
@@ -176,7 +178,9 @@ module.exports = async (req, res) => {
       // Copie programs + teamowner='0'
       const updates = { teamowner: '0' };
       for (const f of FIELD_IDS) {
-        updates[f] = String(customFields[f] || '0');  // Fix: string pour cohérence
+        const rawVal = customFields[f];
+        updates[f] = String(rawVal || '0');  // String pour cohérence
+        console.log(`[MS] Copy ${f}: raw=${rawVal} (type=${typeof rawVal}) → update='${updates[f]}'`);  // Debug per field
       }
       console.log('[MS] Updates built', updates);
       await msPatchMember(env, newMemberId, updates);
