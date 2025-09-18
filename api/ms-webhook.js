@@ -3,13 +3,14 @@
  * Memberstack team events → copie customFields de l'owner vers team member
  * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0'
  * - Event: team.member.removed → deactivate
- * - Svix signature vérifiée proprement (avec createMessage)
+ * - Svix signature vérifiée proprement (direct verify, sans createMessage)
  * - Env forcé 'test'
  * - Logs détaillés pour debug
+ * - Fix: evtKey sur svix_id pour idempotence robuste
  */
 
 const fetch = require('node-fetch');
-const { Webhook, createMessage } = require('svix');  // Ajout createMessage
+const { Webhook } = require('svix');  // Retiré createMessage (inutile/cassé)
 const { kvGet, kvSet } = require('./kv.js');
 
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
@@ -116,16 +117,14 @@ module.exports = async (req, res) => {
   try {
     const wh = new Webhook(msWebhookSecret);
     const payload = Buffer.from(payloadStr, 'utf-8');
-    // Build headers object for createMessage
+    // Headers obj direct pour verify (standard Svix API)
     const headersObj = {
       'svix-id': svix_id,
       'svix-timestamp': svix_timestamp,
       'svix-signature': svix_signature
     };
     console.log('[MS] Svix headers obj', headersObj);
-    const message = createMessage(payload, headersObj);  // Créé le message structuré
-    console.log('[MS] Message created OK', { messageType: typeof message });
-    event = wh.verify(message);  // Vérif sur message
+    event = wh.verify(payload, headersObj);  // Direct verify (fix: sans createMessage)
     console.log('[MS] Signature verified OK', { eventType: event.type });
   } catch (e) {
     console.error('[MS] Svix verify error full', { message: e.message, stack: e.stack, headers: { svix_id, svix_timestamp, svix_signature: svix_signature ? 'PRESENT' : 'MISSING' } });
@@ -133,12 +132,13 @@ module.exports = async (req, res) => {
   }
 
   const fullPayload = JSON.parse(payloadStr);
-  console.log('[MS] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}), timestamp: fullPayload.timestamp });
+  console.log('[MS] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}), timestamp: fullPayload.timestamp, fullPayloadId: fullPayload.id });
   const type = fullPayload.event;
   const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
   console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId });
 
-  const evtKey = `ms-processed:${env}:${fullPayload.id || Date.now()}`;
+  // Fix: evtKey sur svix_id pour idempotence (plus robuste que fullPayload.id)
+  const evtKey = `ms-processed:${env}:${svix_id}`;
   const processed = await kvGet(evtKey);
   if (processed) {
     console.log('[MS] Already processed (KV value:', processed, '), skip');
