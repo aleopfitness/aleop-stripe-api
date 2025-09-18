@@ -1,8 +1,9 @@
 /**
  * /api/ms-webhook.js
  * Memberstack team events → copie customFields de l'owner vers team member
- * - Event: team.member.added → copie SEULEMENT programs flags + teamowner='0' + club (nommé par owner)
+ * - Event: team.member.added → copie programs flags + teamowner='0' + club
  * - Event: team.member.removed → deactivate
+ * - Event: member.updated → si owner (teamowner='1') et club changé, propage à team members
  * - Svix signature vérifiée proprement (direct verify, sans createMessage)
  * - Env forcé 'test'
  * - Logs détaillés pour debug
@@ -64,6 +65,27 @@ async function msGetMember(env, memberId) {
   const fields = data.customFields || {};
   console.log('[MS] GET parsed fields', { memberId, fieldsPreview: Object.keys(fields), fields: fields });
   return data;
+}
+async function msListTeamMembers(env, teamId) {
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const url = `https://admin.memberstack.com/teams/${teamId}/members`;
+  console.log('[MS] List team members start', { env, teamId, keyPrefix: String(key).slice(0,6) });
+  const r = await fetch(url, { headers: msHeaders(key) });
+  const txt = await r.text();
+  console.log('[MS] List response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) throw new Error(`MS list team ${r.status}: ${txt}`);
+  let data;
+  try {
+    data = JSON.parse(txt || '[]');
+    data = data.data || data;  // Unwrap si array wrapped
+  } catch (e) {
+    console.error('[MS] List parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  const members = data.map(m => m.id || m.memberId).filter(Boolean);
+  console.log('[MS] List parsed', { teamId, memberCount: members.length, memberIds: members });
+  return members;
 }
 async function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -136,8 +158,8 @@ module.exports = async (req, res) => {
   const fullPayload = JSON.parse(payloadStr);
   console.log('[MS] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}), timestamp: fullPayload.timestamp, fullPayloadId: fullPayload.id });
   const type = fullPayload.event;
-  const { memberId: newMemberId, ownerId, teamId } = fullPayload.payload || {};
-  console.log('=== MS WEBHOOK START ===', { event: type, newMemberId, ownerId, teamId });
+  const { memberId, ownerId, teamId } = fullPayload.payload || {};  // memberId pour updated, ownerId pour team events
+  console.log('=== MS WEBHOOK START ===', { event: type, memberId, ownerId, teamId });
 
   const evtKey = `ms-processed:${env}:${svix_id}`;
   const processed = await kvGet(evtKey);
@@ -148,6 +170,7 @@ module.exports = async (req, res) => {
 
   try {
     if (type === 'team.member.added') {
+      const newMemberId = memberId;
       if (!newMemberId || !ownerId) {
         console.log('[MS] Missing IDs', { newMemberId, ownerId });
         await kvSetEx(evtKey, 1, 3600);
@@ -189,10 +212,68 @@ module.exports = async (req, res) => {
       console.log(`[MS] Copied to new member=${newMemberId} from owner=${ownerId}`);
 
     } else if (type === 'team.member.removed') {
-      console.log('[MS] Removed event', { newMemberId });
-      if (newMemberId) {
-        await msPatchMember(env, newMemberId, buildFlags([], false));
-        console.log(`[MS] Deactivated ${newMemberId}`);
+      console.log('[MS] Removed event', { memberId });
+      if (memberId) {
+        await msPatchMember(env, memberId, buildFlags([], false));
+        console.log(`[MS] Deactivated ${memberId}`);
+      }
+
+    } else if (type === 'member.updated') {
+      console.log('[MS] Updated event', { memberId });
+      if (!memberId) {
+        console.log('[MS] Missing memberId for update');
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+
+      let updatedMember;
+      try {
+        updatedMember = await msGetMember(env, memberId);
+      } catch (e) {
+        console.error('[MS] msGetMember error for update', { memberId, eMessage: e.message });
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+
+      const customFields = updatedMember.customFields || {};
+      const teamOwnerFlag = String(customFields.teamowner || '') === '1';
+      if (!teamOwnerFlag) {
+        console.log('[MS] Skip update - not owner', { memberId, teamowner: customFields.teamowner });
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+
+      // Cherche teamId de l'owner (assume dans customFields ou GET extra ; ici fallback simple via GET)
+      const ownerTeamId = updatedMember.teamId || teamId;  // Si pas, ajouter GET /teams pour owner
+      if (!ownerTeamId) {
+        console.error('[MS] No teamId for owner update', { memberId });
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+
+      // Liste members du team (exclut owner)
+      const teamMembers = await msListTeamMembers(env, ownerTeamId);
+      const memberIds = teamMembers.filter(id => id !== memberId);  // Exclut self
+      if (memberIds.length === 0) {
+        console.log('[MS] No members to update');
+        await kvSetEx(evtKey, 1, 3600);
+        return res.status(200).send();
+      }
+
+      // Si club présent, propage
+      if (customFields.club) {
+        const clubUpdate = { club: String(customFields.club) };
+        console.log('[MS] Propagating club update', { club: clubUpdate.club, toMembers: memberIds.length });
+        for (const mid of memberIds) {
+          try {
+            await msPatchMember(env, mid, clubUpdate);
+          } catch (patchErr) {
+            console.error('[MS] Patch error on propagation', { mid, err: patchErr.message });
+          }
+        }
+        console.log(`[MS] Club propagated to ${memberIds.length} members`);
+      } else {
+        console.log('[MS] No club to propagate on update');
       }
 
     } else {
