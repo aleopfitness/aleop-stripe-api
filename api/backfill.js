@@ -1,8 +1,8 @@
 // pages/api/backfill.js
-// API "ouvrir l’URL = ça lance" (JSON)
+// Backfill minimal depuis Memberstack Teams → écrit uniquement: teamid, teamowner, club
 // Par défaut: ENV=TEST + DRY-RUN (aucune écriture)
-// Modifie UNIQUEMENT: teamid, teamowner, club
-// TEST: pas de token requis. LIVE: besoin de BACKFILL_TOKEN.
+// TEST: pas de token. LIVE: BACKFILL_TOKEN requis.
+// Bonus: ?selftest=1 pour diagnostiquer la connexion & les variables.
 
 const API = "https://admin.memberstack.com";
 
@@ -29,7 +29,6 @@ async function msGet(path, key) { return msFetch(path, key); }
 async function msPatchMember(id, customFields, key) {
   return msFetch(`/members/${id}`, key, { method:"PATCH", body: JSON.stringify({ customFields }) }, 3, 600);
 }
-
 async function listTeams(key) {
   const out = []; let after;
   do {
@@ -41,19 +40,16 @@ async function listTeams(key) {
   } while (after);
   return out;
 }
-
 function pickMembersArray(team) {
   const raw = Array.isArray(team?.members) ? team.members : (team?.teamMembers || []);
   return (raw || [])
     .map(m => ({ id: m?.id || m?.memberId || m?.member?.id || m?.userId }))
     .filter(x => !!x?.id);
 }
-
 async function getMember(id, key) {
   const json = await msGet(`/members/${id}`, key);
   return json?.data || json;
 }
-
 function limiter(max = 6) {
   let running = 0; const queue = [];
   const next = () => { running--; queue.shift()?.(); };
@@ -72,7 +68,7 @@ module.exports = async function handler(req, res) {
     const key = getKey(envFlag);
     if (!key) return res.status(500).json({ error: `Missing Memberstack API key for env=${envFlag}` });
 
-    // Auth: TEST = pas de token. LIVE = token obligatoire.
+    // LIVE → token obligatoire
     if (isLive) {
       const headerAuth = req.headers.authorization || "";
       const token = (q.token?.toString() || "").trim() || headerAuth.replace(/^Bearer\s+/i, "");
@@ -84,10 +80,34 @@ module.exports = async function handler(req, res) {
     const dry  = (q.dry?.toString() ?? "1") !== "0";              // dry-run par défaut
     const conc = Math.max(1, Math.min(10, Number(q.conc || "6")));
     const filter = new Set((q.filter?.toString() || "").split(",").map(s=>s.trim()).filter(Boolean));
-
     const CF_TEAMID    = process.env.CF_TEAMID    || "teamid";
     const CF_TEAMOWNER = process.env.CF_TEAMOWNER || "teamowner";
     const CF_CLUB      = process.env.CF_CLUB      || "club";
+
+    // --- MODE AUTOTEST ---
+    if (String(q.selftest||"") === "1") {
+      try {
+        const sample = await msGet(`/teams?limit=1`, key);
+        const items = Array.isArray(sample?.data) ? sample.data : (sample?.items || []);
+        const firstTeam = items?.[0] || null;
+        return res.status(200).json({
+          ok: true,
+          env: envFlag,
+          dryRunDefault: true,
+          apiReachable: true,
+          teamsSampleCount: items.length || 0,
+          firstTeamId: firstTeam?.id || firstTeam?.teamId || null,
+          notes: "Si ok=true, tu peux lancer /api/backfill (dry-run par défaut)."
+        });
+      } catch (e) {
+        return res.status(500).json({
+          ok: false,
+          env: envFlag,
+          apiReachable: false,
+          error: e?.message || String(e)
+        });
+      }
+    }
 
     const stats = {
       env: envFlag, live: isLive, dryRun: dry, conc,
@@ -108,7 +128,7 @@ module.exports = async function handler(req, res) {
 
       // Owner
       let owner; try { owner = await getMember(ownerId, key); }
-      catch(e){ console.error("Owner fetch err", teamId, ownerId, e.message); continue; }
+      catch(e){ continue; }
 
       const ocf = owner.customFields || {};
       const ownerClub = ocf[CF_CLUB] ? String(ocf[CF_CLUB]) : "";
@@ -125,9 +145,7 @@ module.exports = async function handler(req, res) {
       const members = pickMembersArray(team);
       await Promise.all(members.map(m => runLimited(async () => {
         if (!m.id || m.id === owner.id) return;
-        let mem; try { mem = await getMember(m.id, key); }
-        catch(e) { console.error("Member fetch err", m.id, e.message); return; }
-
+        let mem; try { mem = await getMember(m.id, key); } catch (e) { return; }
         const cf = mem.customFields || {};
         const patch = {};
         if (String(cf[CF_TEAMID] || "") !== String(teamId)) patch[CF_TEAMID] = String(teamId);
@@ -147,7 +165,6 @@ module.exports = async function handler(req, res) {
     stats.durationMs = Date.now() - t0;
     return res.status(200).json(stats);
   } catch (e) {
-    console.error(e);
     return res.status(500).json({ error: e?.message || "error" });
   }
 };
