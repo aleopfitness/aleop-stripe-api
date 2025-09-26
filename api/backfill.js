@@ -21,6 +21,54 @@ module.exports = async (req, res) => {
     const FILTER = new Set(['cmfprqvy700230xmn9ie4ecxa']); // Hardcoded pour cette team seulement
     const limit = pLimit(6);
 
+    // Déplace les fonctions ici, à l'intérieur du handler, pour accéder à API et HDR
+    async function listTeams() {
+      const out = [];
+      let after;
+      do {
+        const url = `${API}/teams?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`;
+        const r = await fetch(url, { headers: HDR });
+        const txt = await r.text();
+        if (!r.ok) throw new Error(`List teams ${r.status}: ${txt}`);
+        const json = JSON.parse(txt || '{}');
+        const data = json.data || json;
+        const items = Array.isArray(data) ? data : (data.items || []);
+        out.push(...items);
+        after = json.endCursor || json.nextCursor || null;
+      } while (after);
+      return out;
+    }
+
+    async function getMember(memberId) {
+      const r = await fetch(`${API}/members/${memberId}`, { headers: HDR });
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`Get member ${r.status}: ${txt}`);
+      const json = JSON.parse(txt || '{}');
+      return json.data || json;
+    }
+
+    async function patchMember(memberId, customFields) {
+      if (DRY) {
+        console.log('🔎 DRY update', memberId, customFields);
+        return;
+      }
+      const r = await fetch(`${API}/members/${memberId}`, {
+        method: 'PATCH',
+        headers: HDR,
+        body: JSON.stringify({ customFields })
+      });
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`Patch member ${r.status}: ${txt}`);
+    }
+
+    function pickMembersArray(teamObj) {
+      let arr = teamObj.members || teamObj.teamMembers || [];
+      if (!Array.isArray(arr)) arr = [];
+      return arr.map(m => ({
+        id: m.id || m.memberId || m.member?.id || m.userId || null
+      })).filter(x => !!x.id);
+    }
+
     console.log(`Start backfill (ENV=${ENV}, DRY_RUN=${DRY}) …`);
     const teams = await listTeams();
     console.log(`Teams trouvées: ${teams.length}`);
@@ -84,50 +132,3 @@ module.exports = async (req, res) => {
     res.status(500).send('Error: ' + e.message);
   }
 };
-
-async function listTeams() {
-  const out = [];
-  let after;
-  do {
-    const url = `${API}/teams?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`;
-    const r = await fetch(url, { headers: HDR });
-    const txt = await r.text();
-    if (!r.ok) throw new Error(`List teams ${r.status}: ${txt}`);
-    const json = JSON.parse(txt || '{}');
-    const data = json.data || json;
-    const items = Array.isArray(data) ? data : (data.items || []);
-    out.push(...items);
-    after = json.endCursor || json.nextCursor || null;
-  } while (after);
-  return out;
-}
-
-async function getMember(memberId) {
-  const r = await fetch(`${API}/members/${memberId}`, { headers: HDR });
-  const txt = await r.text();
-  if (!r.ok) throw new Error(`Get member ${r.status}: ${txt}`);
-  const json = JSON.parse(txt || '{}');
-  return json.data || json;
-}
-
-async function patchMember(memberId, customFields) {
-  if (DRY) {
-    console.log('🔎 DRY update', memberId, customFields);
-    return;
-  }
-  const r = await fetch(`${API}/members/${memberId}`, {
-    method: 'PATCH',
-    headers: HDR,
-    body: JSON.stringify({ customFields })
-  });
-  const txt = await r.text();
-  if (!r.ok) throw new Error(`Patch member ${r.status}: ${txt}`);
-}
-
-function pickMembersArray(teamObj) {
-  let arr = teamObj.members || teamObj.teamMembers || [];
-  if (!Array.isArray(arr)) arr = [];
-  return arr.map(m => ({
-    id: m.id || m.memberId || m.member?.id || m.userId || null
-  })).filter(x => !!x.id);
-}
