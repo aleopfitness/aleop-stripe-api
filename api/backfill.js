@@ -1,145 +1,176 @@
-// Backfill Memberstack customFields : teamid, teamowner, club (inspired your webhooks, group by planId, generate ID format if missing)
-const fetch = require('node-fetch');
+// pages/backfill.js
+// Visite /backfill pour lancer un backfill minimal depuis l'API Teams Memberstack
+// Remplit uniquement: teamid, teamowner, club
+// Sécurisé par BACKFILL_TOKEN (via ?token=...)
+// Paramètres: ?env=test|live (def: test), ?dry=1|0 (def: 1), ?filter=tm_1,tm_2, ?conc=6
 
-function msApiKey(env) {
-  return env === 'live'
-    ? process.env.MEMBERSTACK_API_KEY_LIVE
-    : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
-}
+export async function getServerSideProps(ctx) {
+  const t0 = Date.now();
+  const q = ctx.query || {};
+  const headerAuth = ctx.req.headers.authorization || "";
+  const token = (q.token?.toString() || "").trim() || headerAuth.replace(/^Bearer\s+/i, "");
+  if (!process.env.BACKFILL_TOKEN || token !== process.env.BACKFILL_TOKEN) {
+    return { notFound: true }; // 404 si pas autorisé
+  }
 
-function msHeaders(key) {
-  return { 'X-API-KEY': key, 'Content-Type': 'application/json' };
-}
+  const envFlag = (q.env?.toString() || "test").toLowerCase();
+  const KEY =
+    envFlag === "live" || envFlag === "prod" || envFlag === "production"
+      ? process.env.MEMBERSTACK_API_KEY_LIVE
+      : (process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY);
+  if (!KEY) {
+    return { props: { error: `Missing Memberstack API key for env=${envFlag}` } };
+  }
 
-module.exports = async (req, res) => {
-  try {
-    const ENV = 'test'; // Hardcoded test
-    const KEY = msApiKey(ENV);
-    if (!KEY) throw new Error(`Missing Memberstack API key for env=${ENV}`);
+  const dry = (q.dry?.toString() ?? "1") !== "0";            // dry-run par défaut
+  const conc = Math.max(1, Math.min(10, Number(q.conc || "6")));
+  const filter = new Set((q.filter?.toString() || "").split(",").map(s => s.trim()).filter(Boolean));
 
-    console.log('Using API key prefix: ' + KEY.slice(0,6)); // Debug
+  // Noms des custom fields (override possible via env)
+  const CF_TEAMID    = process.env.CF_TEAMID    || "teamid";
+  const CF_TEAMOWNER = process.env.CF_TEAMOWNER || "teamowner";
+  const CF_CLUB      = process.env.CF_CLUB      || "club";
 
-    const API = 'https://admin.memberstack.com';
-    const HDR = msHeaders(KEY);
-    const DRY = true; // Hardcoded true for dry-run
-    const CF = { teamId: 'teamid', teamOwner: 'teamowner', club: 'club' }; // Hardcoded
+  const API = "https://admin.memberstack.com";
+  const hdr = { "X-API-KEY": KEY, "Content-Type": "application/json" };
 
-    // Generate ID in similar format (24 chars alphanum, like cmfpy3zx4002cmn0x37yu1qzp)
-    function generateTeamId() {
-      const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-      let id = '';
-      for (let i = 0; i < 8; i++) id += chars[Math.floor(Math.random() * 26)]; // letters
-      for (let i = 0; i < 4; i++) id += chars[26 + Math.floor(Math.random() * 10)]; // digits
-      for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * 26)]; // letters
-      for (let i = 0; i < 4; i++) id += chars[26 + Math.floor(Math.random() * 10)]; // digits
-      for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * 26)]; // letters
-      return id;
-    }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-    // List all members (like in your webhooks)
-    async function listMembers() {
-      const out = [];
-      let after;
-      do {
-        const url = `${API}/members?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`;
-        console.log('Fetching members URL: ' + url); // Debug
-        const r = await fetch(url, { headers: HDR });
-        const txt = await r.text();
-        if (!r.ok) throw new Error(`List members ${r.status}: ${txt}`);
-        const json = JSON.parse(txt || '{}');
-        const data = json.data || json;
-        const items = Array.isArray(data) ? data : (data.items || []);
-        out.push(...items);
-        after = json.endCursor || json.nextCursor || null;
-      } while (after);
-      return out;
-    }
-
-    async function patchMember(memberId, customFields) {
-      if (DRY) {
-        console.log('[DRY] Update', memberId, customFields);
-        return;
-      }
-      const url = `${API}/members/${memberId}`;
-      const r = await fetch(url, {
-        method: 'PATCH',
-        headers: HDR,
-        body: JSON.stringify({ customFields })
-      });
+  async function msFetch(path, init = {}, tries = 3, backoff = 400) {
+    for (let i = 0; i < tries; i++) {
+      const r = await fetch(`${API}${path}`, { ...init, headers: { ...hdr, ...(init.headers || {}) } });
       const txt = await r.text();
-      if (!r.ok) throw new Error(`Patch member ${r.status}: ${txt}`);
+      let json = null; try { json = txt ? JSON.parse(txt) : null; } catch {}
+      if (r.ok) return json;
+      if (i === tries - 1) throw new Error(`${init.method || "GET"} ${path} -> ${r.status} ${txt}`);
+      await sleep(backoff * (i + 1));
     }
+  }
 
-    console.log(`Start backfill (ENV=${ENV}, DRY_RUN=${DRY}) …`);
-    const members = await listMembers();
-    console.log(`Members trouvés: ${members.length}`);
+  async function listTeams() {
+    const out = [];
+    let after;
+    do {
+      const p = new URLSearchParams({ limit: "100" });
+      if (after) p.set("after", after);
+      const json = await msFetch(`/teams?${p.toString()}`);
+      const data = Array.isArray(json?.data) ? json.data : (json?.items || []);
+      out.push(...data);
+      after = json?.endCursor || json?.nextCursor || undefined;
+    } while (after);
+    return out;
+  }
 
-    let changed = 0;
+  async function getMember(id) {
+    const json = await msFetch(`/members/${id}`);
+    return json?.data || json;
+  }
 
-    // Group by planId (proxy for team, from m.planIds or m.plans)
-    const groups = {};
-    for (const m of members) {
-      const planId = m.planIds ? m.planIds[0] : (m.plans ? m.plans[0].id : '');
-      if (planId) {
-        if (!groups[planId]) groups[planId] = { owners: [], members: [] };
-        const cf = m.customFields || {};
-        if (String(cf[CF.teamOwner] || '') === '1') groups[planId].owners.push(m);
-        else groups[planId].members.push(m);
-      } else {
-        console.log(`Skip member ${m.id} no planId`);
-      }
-    }
+  async function patchMember(id, customFields) {
+    if (dry) return true; // simulation
+    await msFetch(`/members/${id}`, { method: "PATCH", body: JSON.stringify({ customFields }) }, 3, 600);
+    return true;
+  }
 
-    for (const planId in groups) {
-      const g = groups[planId];
-      if (g.owners.length === 0) {
-        console.log(`Skip plan ${planId} no owner`);
-        continue;
-      }
-      const owner = g.owners[0];
-      const ownerId = owner.id;
-      const ownerCF = owner.customFields || {};
-      let teamId = ownerCF[CF.teamId] || '';
+  function pickMembersArray(team) {
+    const raw = Array.isArray(team?.members) ? team.members : (team?.teamMembers || []);
+    return (raw || [])
+      .map(m => ({ id: m?.id || m?.memberId || m?.member?.id || m?.userId }))
+      .filter(x => !!x?.id);
+  }
 
-      if (!teamId) {
-        teamId = generateTeamId();
-        console.log(`Generated teamId ${teamId} for plan ${planId}`);
-      }
+  function limiter(max = 6) {
+    let running = 0; const queue = [];
+    const next = () => { running--; queue.shift()?.(); };
+    return async (fn) => new Promise((resolve, reject) => {
+      const run = () => { running++; fn().then(v => { next(); resolve(v); }).catch(e => { next(); reject(e); }); };
+      if (running < max) run(); else queue.push(run);
+    });
+  }
 
-      // Update owner
+  const stats = {
+    env: envFlag, dryRun: dry, conc,
+    teamsTotal: 0, teamsProcessed: 0, skippedNoOwner: 0,
+    ownerUpdated: 0, membersUpdated: 0,
+    examples: []
+  };
+
+  try {
+    const teams = await listTeams();
+    stats.teamsTotal = teams.length;
+    const runLimited = limiter(conc);
+
+    for (const team of teams) {
+      const teamId = team?.id || team?.teamId;
+      if (!teamId) continue;
+      if (filter.size && !filter.has(teamId)) continue;
+
+      const ownerId = team?.ownerId || team?.owner?.id;
+      if (!ownerId) { stats.skippedNoOwner++; continue; }
+
+      // Owner
+      let owner;
+      try { owner = await getMember(ownerId); }
+      catch (e) { console.error("Owner fetch err", teamId, ownerId, e.message); continue; }
+
+      const ocf = owner.customFields || {};
+      const ownerClub = ocf[CF_CLUB] ? String(ocf[CF_CLUB]) : "";
+
       const ownerPatch = {};
-      if (String(ownerCF[CF.teamId] || '') !== teamId) ownerPatch[CF.teamId] = teamId;
-      if (String(ownerCF[CF.teamOwner] || '') !== '1') ownerPatch[CF.teamOwner] = '1';
+      if (String(ocf[CF_TEAMID] || "") !== String(teamId)) ownerPatch[CF_TEAMID] = String(teamId);
+      if (String(ocf[CF_TEAMOWNER] || "") !== "1")        ownerPatch[CF_TEAMOWNER] = "1";
       if (Object.keys(ownerPatch).length) {
-        await patchMember(ownerId, ownerPatch);
-        changed++;
+        await patchMember(owner.id, ownerPatch);
+        stats.ownerUpdated++;
+        if (stats.examples.length < 5) stats.examples.push({ memberId: owner.id, patch: ownerPatch });
       }
 
-      const ownerClub = ownerCF[CF.club] || '';
-
-      // Update members
-      for (const mem of g.members) {
-        const memId = mem.id;
+      // Members
+      const members = pickMembersArray(team);
+      await Promise.all(members.map(m => runLimited(async () => {
+        if (!m.id || m.id === owner.id) return;
+        let mem; try { mem = await getMember(m.id); } catch (e) { console.error("Member fetch err", m.id, e.message); return; }
         const cf = mem.customFields || {};
         const patch = {};
-        if (String(cf[CF.teamId] || '') !== teamId) patch[CF.teamId] = teamId;
-        if (String(cf[CF.teamOwner] || '') !== '0') patch[CF.teamOwner] = '0';
-        if (ownerClub && String(cf[CF.club] || '') !== ownerClub) patch[CF.club] = ownerClub;
+        if (String(cf[CF_TEAMID] || "") !== String(teamId)) patch[CF_TEAMID] = String(teamId);
+        if (String(cf[CF_TEAMOWNER] || "") !== "0")        patch[CF_TEAMOWNER] = "0";
+        if (ownerClub && String(cf[CF_CLUB] || "") !== ownerClub) patch[CF_CLUB] = ownerClub;
 
         if (Object.keys(patch).length) {
-          await patchMember(memId, patch);
-          changed++;
+          await patchMember(mem.id, patch);
+          stats.membersUpdated++;
+          if (stats.examples.length < 5) stats.examples.push({ memberId: mem.id, patch });
         }
-      }
+      })));
 
-      console.log(`✅ Plan ${planId} traité (teamId=${teamId}, owner=${ownerId}, members=${g.members.length})`);
+      stats.teamsProcessed++;
     }
 
-    const message = `${DRY ? 'Dry-run' : 'Done'} (ENV=${ENV}) — ${changed} mise(s) à jour.`;
-    console.log(message);
-    res.status(200).send(message);
+    stats.durationMs = Date.now() - t0;
+    return { props: { stats } };
   } catch (e) {
-    console.error('Backfill error:', e);
-    res.status(500).send('Error: ' + e.message);
+    return { props: { error: e?.message || "error", durationMs: Date.now() - t0 } };
   }
-};
+}
+
+export default function BackfillPage({ stats, error, durationMs }) {
+  return (
+    <main style={{ fontFamily: "system-ui, sans-serif", padding: 24 }}>
+      <h1>Memberstack Backfill</h1>
+      {error ? (
+        <>
+          <p style={{ color: "crimson" }}><b>Erreur :</b> {error}</p>
+          {durationMs ? <p>Durée: {durationMs} ms</p> : null}
+        </>
+      ) : (
+        <>
+          <p><b>Env:</b> {stats?.env} • <b>Dry-run:</b> {String(stats?.dryRun)} • <b>Conc:</b> {stats?.conc}</p>
+          <p><b>Teams:</b> {stats?.teamsProcessed}/{stats?.teamsTotal} • <b>Owners maj:</b> {stats?.ownerUpdated} • <b>Membres maj:</b> {stats?.membersUpdated} • <b>Skipped no owner:</b> {stats?.skippedNoOwner}</p>
+          <pre style={{ background: "#111", color: "#0f0", padding: 16, borderRadius: 8, overflowX: "auto" }}>
+{JSON.stringify(stats, null, 2)}
+          </pre>
+        </>
+      )}
+    </main>
+  );
+}
