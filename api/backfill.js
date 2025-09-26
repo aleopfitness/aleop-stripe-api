@@ -1,4 +1,4 @@
-// Backfill Memberstack customFields : teamid, teamowner, club (V2 API, try teams, fallback members group by plan)
+// Backfill Memberstack customFields : teamid, teamowner, club (lookup team from member fiche via planId, generate similar format if missing)
 const fetch = require('node-fetch');
 
 function msApiKey(env) {
@@ -11,38 +11,26 @@ module.exports = async (req, res) => {
   try {
     const ENV = 'test'; // Hardcoded test
     const KEY = msApiKey(ENV);
-    if (!KEY) throw new Error(`Missing Memberstack API key for env=${ENV}`); 
+    if (!KEY) throw new Error(`Missing Memberstack API key for env=${ENV}`);
 
     console.log('Using API key prefix: ' + KEY.slice(0,8)); // Debug
 
-    const API = 'https://api.memberstack.com/v1'; // V2 base
-    const HDR = { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' };
-    const DRY = true; // Hardcoded true pour dry-run initial
+    const API = 'https://admin.memberstack.com'; // Base for member fiche
+    const HDR = { 'X-API-KEY': KEY, 'Content-Type': 'application/json' };
+    const DRY = true; // Hardcoded true for dry-run
     const CF = { teamId: 'teamid', teamOwner: 'teamowner', club: 'club' }; // Hardcoded
 
-    // Try to list teams (if available)
-    async function listTeams() {
-      const out = [];
-      let after;
-      do {
-        const url = `${API}/teams?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`;
-        console.log('Fetching teams URL: ' + url); // Debug
-        const r = await fetch(url, { headers: HDR });
-        const txt = await r.text();
-        if (!r.ok) {
-          console.error(`List teams ${r.status}: ${txt}`);
-          return null; // Fallback if 404
-        }
-        const json = JSON.parse(txt || '{}');
-        const data = json.data || json;
-        const items = Array.isArray(data) ? data : (data.items || []);
-        out.push(...items);
-        after = json.endCursor || json.nextCursor || null;
-      } while (after);
-      return out;
+    // Generate similar format teamId (24 lower alphanum chars)
+    function generateTeamId() {
+      const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+      let id = '';
+      for (let i = 0; i < 24; i++) {
+        id += chars[Math.floor(Math.random() * chars.length)];
+      }
+      return id;
     }
 
-    // List all members (fallback if no teams)
+    // List all members (fiche)
     async function listMembers() {
       const out = [];
       let after;
@@ -75,55 +63,36 @@ module.exports = async (req, res) => {
       if (!r.ok) throw new Error(`Patch member ${r.status}: ${txt}`);
     }
 
-    function pickMembersArray(teamObj) {
-      let arr = teamObj.members || teamObj.teamMembers || [];
-      if (!Array.isArray(arr)) arr = [];
-      return arr.map(m => ({
-        id: m.id || m.memberId || m.member?.id || m.userId || null
-      })).filter(x => !!x.id);
-    }
-
     console.log(`Start backfill (ENV=${ENV}, DRY_RUN=${DRY}) …`);
-
-    let teams = await listTeams();
-    if (!teams) {
-      console.log('Fallback to list members and group by plan/club');
-      const members = await listMembers();
-      teams = [];
-      const groups = {};
-      for (const m of members) {
-        const cf = m.customFields || {};
-        const planId = m.planId || ''; // Assume planId as proxy for team, since all plans are team plans
-        if (planId) {
-          if (!groups[planId]) groups[planId] = { id: planId, ownerId: null, members: [] };
-          if (String(cf[CF.teamOwner] || '') === '1') groups[planId].ownerId = m.id;
-          groups[planId].members.push({ id: m.id });
-        }
-      }
-      for (const planId in groups) {
-        teams.push(groups[planId]);
-      }
-    }
-    console.log(`Teams/groups trouvés: ${teams.length}`);
+    const members = await listMembers();
+    console.log(`Members trouvés: ${members.length}`);
 
     let changed = 0;
 
-    for (const team of teams) {
-      const teamId = team.id || team.teamId;
-      if (!teamId) continue;
+    // Group by planId (proxy for team, from member fiche, since plans are team plans)
+    const groups = {};
+    for (const m of members) {
+      const planId = m.planIds ? m.planIds[0] : ''; // First planId from fiche as team proxy
+      if (planId) {
+        if (!groups[planId]) groups[planId] = { owners: [], members: [] };
+        const cf = m.customFields || {};
+        if (String(cf[CF.teamOwner] || '') === '1') groups[planId].owners.push(m);
+        else groups[planId].members.push(m);
+      } else {
+        console.log(`⏭️ Member ${m.id} sans planId in fiche → skip`);
+      }
+    }
 
-      const ownerId = team.ownerId || team.owner?.id;
-      if (!ownerId) {
-        console.log(`⏭️ Team ${teamId} sans owner → skip`);
+    for (const planId in groups) {
+      const g = groups[planId];
+      if (g.owners.length === 0) {
+        console.log(`⏭️ Plan/team proxy ${planId} sans owner → skip`);
         continue;
       }
-
-      const members = pickMembersArray(team);
-
-      // Get owner data
-      const owner = await listMembers().find(m => m.id === ownerId); // Simple find, since no get single in fallback
+      const owner = g.owners[0]; // Assume 1 owner per plan/team
+      const ownerId = owner.id;
       const ownerCF = owner.customFields || {};
-      const ownerClub = ownerCF[CF.club] || '';
+      const teamId = ownerCF[CF.teamId] || generateTeamId(); // Lookup from owner fiche, generate similar if missing
 
       // Update owner
       const ownerPatch = {};
@@ -134,10 +103,11 @@ module.exports = async (req, res) => {
         changed++;
       }
 
+      const ownerClub = ownerCF[CF.club] || '';
+
       // Update members
-      for (const m of members) {
-        if (!m.id || m.id === ownerId) continue;
-        const mem = await listMembers().find(m2 => m2.id === m.id);
+      for (const mem of g.members) {
+        const memId = mem.id;
         const cf = mem.customFields || {};
         const patch = {};
         if (String(cf[CF.teamId] || '') !== teamId) patch[CF.teamId] = teamId;
@@ -145,12 +115,12 @@ module.exports = async (req, res) => {
         if (ownerClub && String(cf[CF.club] || '') !== ownerClub) patch[CF.club] = ownerClub;
 
         if (Object.keys(patch).length) {
-          await patchMember(m.id, patch);
+          await patchMember(memId, patch);
           changed++;
         }
       }
 
-      console.log(`✅ Team ${teamId} traitée (owner=${ownerId})`);
+      console.log(`✅ Plan/team proxy ${planId} traité (teamId=${teamId}, owner=${ownerId}, members=${g.members.length})`);
     }
 
     const message = `${DRY ? 'Dry-run' : 'Done'} (ENV=${ENV}) — ${changed} mise(s) à jour.`;
