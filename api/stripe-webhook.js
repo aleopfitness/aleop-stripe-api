@@ -1,22 +1,21 @@
 /**
- * /api/stripe-webhook.js
- * Stripe (test/live) → retrouve l'intent en KV → met à jour Memberstack customFields
- * - Compatible avec tes pointeurs { intentId, env, t } écrits par TON intent.js
- * - KV: utilise kv.js (Vercel KV) avec logs
- * - Test mode: ?test=1&key=XXX pour debug kvGet isolé
- * - Memberstack: header 'X-API-KEY' + URLs SANS '/v2'
- * - Raw body Stripe (signature)
- *
- * ⚠️ Si tu es sur Next.js (pages/api), ajoute en bas:
- * export const config = { api: { bodyParser: false } };
+ * /api/stripe-webhook.js  — Dual env (LIVE/TEST) by signature
+ * Adapte ton ancien handler pour détecter l'environnement en vérifiant la signature
+ * avec STRIPE_WEBHOOK_SECRET_LIVE puis STRIPE_WEBHOOK_SECRET_TEST (fallback sur STRIPE_WEBHOOK_SECRET si présent).
+ * Ne change PAS ta logique métier : KV, flags, Memberstack… restent identiques.
  */
 const Stripe = require('stripe');
-const { kvGet, kvSetEx: kvSet } = require('./kv.js'); // Import aligné
+const { kvGet, kvSetEx: kvSet } = require('./kv.js');
 const FIELD_IDS = ['athletyx','booty','upper','flow','fight','cycle','force','cardio','mobility'];
-/* --- SECRETS --- */
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-/* --- Utils --- */
+
+/* --- New: env-aware Stripe secrets --- */
+const STRIPE_SECRET_KEY_LIVE = process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY;
+const STRIPE_SECRET_KEY_TEST = process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET_LIVE = process.env.STRIPE_WEBHOOK_SECRET_LIVE || null;
+const STRIPE_WEBHOOK_SECRET_TEST = process.env.STRIPE_WEBHOOK_SECRET_TEST || null;
+const STRIPE_WEBHOOK_SECRET_FALLBACK = process.env.STRIPE_WEBHOOK_SECRET || null; // ancien nom éventuel
+
+/* --- Utils (inchangés) --- */
 function normalizeEmail(s){ return (s || '').trim().toLowerCase(); }
 function msApiKey(env){
   return env === 'live'
@@ -32,7 +31,6 @@ function buildFlags(programs, active=true, seats=0){
   for (const f of FIELD_IDS) out[f] = active && set.has(f) ? '1' : '0';
   return out;
 }
-/* --- Stripe raw body --- */
 async function readRawBody(req){
   return new Promise((resolve, reject) => {
     try{
@@ -43,7 +41,6 @@ async function readRawBody(req){
     }catch(err){ reject(err); }
   });
 }
-/* --- Memberstack Admin REST --- */
 async function msFindMemberIdByEmail(env, email){
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
@@ -76,7 +73,41 @@ async function msPatchMember(env, memberId, customFields){
   }
   console.log('[MS] PATCH OK', { status: r.status });
 }
-/* --- Test Mode (debug KV sans Stripe) --- */
+
+/* --- New: helpers pour vérifier signature & détecter env --- */
+function getStripeInstance() {
+  // L’API key n’est pas utilisée pour vérifier la signature ; on prend celle dispo.
+  const anyKey = STRIPE_SECRET_KEY_LIVE || STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY || 'sk_test_dummy';
+  return new Stripe(anyKey, { apiVersion: '2024-06-20' });
+}
+function verifyAndDetectEnv(raw, sig) {
+  const stripe = getStripeInstance();
+  // 1) Essaye LIVE
+  if (STRIPE_WEBHOOK_SECRET_LIVE) {
+    try {
+      const evt = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET_LIVE);
+      return { env: 'live', event: evt };
+    } catch (_) {}
+  }
+  // 2) Essaye TEST
+  if (STRIPE_WEBHOOK_SECRET_TEST) {
+    try {
+      const evt = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET_TEST);
+      return { env: 'test', event: evt };
+    } catch (_) {}
+  }
+  // 3) Fallback (ancien `STRIPE_WEBHOOK_SECRET` unique)
+  if (STRIPE_WEBHOOK_SECRET_FALLBACK) {
+    const evt = getStripeInstance().webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET_FALLBACK);
+    const env = evt.livemode ? 'live' : 'test';
+    return { env, event: evt };
+  }
+  const err = new Error('Invalid Stripe signature for both LIVE and TEST');
+  err.status = 400;
+  throw err;
+}
+
+/* --- Test KV (inchangé) --- */
 async function testKvGet(req) {
   const url = new URL(req.url, 'http://x');
   const testKey = url.searchParams.get('key');
@@ -91,9 +122,10 @@ async function testKvGet(req) {
   console.log('[TEST] Parsed:', parsed);
   return { ok: true, raw, parsed };
 }
+
 /* --- Handler --- */
 module.exports = async (req, res) => {
-  // Test mode d'abord (prioritaire, pas besoin raw body)
+  // Mode test KV (pas besoin de raw body)
   const url = new URL(req.url, 'http://x');
   if (url.searchParams.get('test') === '1') {
     const result = await testKvGet(req);
@@ -105,43 +137,47 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Stripe-Signature');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-  if (!STRIPE_SECRET_KEY) return res.status(500).send('STRIPE_SECRET_KEY missing');
-  if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send('STRIPE_WEBHOOK_SECRET missing');
+
+  // Lecture du raw body (obligatoire pour la signature Stripe)
   let raw;
-  try{ raw = await readRawBody(req); }
+  try { raw = await readRawBody(req); }
   catch(e){ console.error('readRawBody error', e); return res.status(400).send('Invalid body'); }
+
+  // Vérifier signature & détecter env (LIVE/TEST) sans dépendre des anciens noms d’ENV
   const sig = req.headers['stripe-signature'] || '';
   let event, env;
-  try{
-    const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
-    event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
-    env = event.livemode ? 'live' : 'test';
-  }catch(e){
+  try {
+    const v = verifyAndDetectEnv(raw, sig);
+    env = v.env; event = v.event;
+  } catch (e) {
     console.error('Stripe constructEvent error:', e && e.message ? e.message : e);
-    return res.status(400).send('Webhook signature error');
+    return res.status(e.status || 400).send('Webhook signature error');
   }
   const type = event.type;
   console.log('=== WEBHOOK START ===', { type, env, livemode: event.livemode, eventId: event.id });
+
   const ACTIVATE = new Set(['checkout.session.completed','invoice.paid']);
   const DEACTIVATE = new Set(['customer.subscription.deleted']);
-  const MAYBE = new Set(['customer.subscription.updated']); // optionnel
-  try{
+  const MAYBE = new Set(['customer.subscription.updated']);
+
+  try {
     const obj = event.data.object;
     const emailKey = normalizeEmail(
       obj?.customer_details?.email || obj?.customer_email || ''
     ) || null;
     const stripeCustomerId = obj?.customer || obj?.customer_id || null;
 
-    // Idempotence simple (évite double-traitement)
+    // Idempotence
     const evtKey = `processed:${env}:${event.id}`;
     if (await kvGet(evtKey)) {
       console.log('[WEBHOOK] Already processed, skip');
       return res.status(200).send();
     }
+
     /* ========== ACTIVATE ========== */
     if (ACTIVATE.has(type)){
       console.log('[ACTIVATE] Starting activation flow');
-      // Retrouver le pointeur PAR EMAIL (conforme à ton intent.js) – utilise kvGet importé
+      // Retrouver le pointeur par email (cf. intent.js)
       let ptr = null;
       let triedPtrKeys = [];
       if (emailKey){
@@ -154,7 +190,7 @@ module.exports = async (req, res) => {
         for (let k of keysToTry) {
           triedPtrKeys.push(k);
           const rawPtr = await kvGet(k);
-          console.log('[PTR] Raw from kvGet for', k, ':', rawPtr, '(type:', typeof rawPtr, ')'); // Log raw
+          console.log('[PTR] Raw from kvGet for', k, ':', rawPtr, '(type:', typeof rawPtr, ')');
           if (rawPtr) {
             try { ptr = typeof rawPtr === 'string' ? JSON.parse(rawPtr) : rawPtr; } catch(e) { console.error('[PTR] Parse error:', e); }
             if (ptr) break;
@@ -163,17 +199,17 @@ module.exports = async (req, res) => {
       }
       if (!ptr){
         console.log('[PTR] NOT FOUND after tries:', triedPtrKeys);
-        // on ACK pour que Stripe retente plus tard
-        return res.status(200).send();
+        return res.status(200).send(); // ACK: Stripe retentera après que le KV soit prêt
       }
       console.log('[PTR] Found:', ptr);
-      // ptr.intentId → clé KV principale intent:${intentId}
+
+      // intent principal
       const intentKey = `intent:${ptr.intentId}`;
       let intent = null;
       console.log('[INTENT] Fetching from', intentKey);
       for (let i=0; i<3; i++){
         const raw = await kvGet(intentKey);
-        console.log(`[INTENT] Raw from kvGet retry ${i+1}:`, raw, '(type:', typeof raw, ')'); // Log raw détaillé
+        console.log(`[INTENT] Raw from kvGet retry ${i+1}:`, raw, '(type:', typeof raw, ')');
         if (raw){
           try{ intent = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { console.error('[INTENT] Parse error:', e); intent = raw; }
         }
@@ -187,7 +223,8 @@ module.exports = async (req, res) => {
         return res.status(200).send();
       }
       console.log('[INTENT] Loaded:', { programs: intent.programs, seats: intent.seats });
-      // Résoudre memberId: on privilégie l’intent (ton front le passait)
+
+      // Résoudre memberId
       let memberId = intent.memberId;
       console.log('[MS] Initial memberId from intent:', memberId);
       if (!memberId && emailKey){
@@ -199,19 +236,20 @@ module.exports = async (req, res) => {
         console.log('[MS] memberId not resolved -> skip');
         return res.status(200).send();
       }
+
       const updates = buildFlags(intent.programs, true, intent.seats);
       console.log('[MS] Updating fields:', updates);
       await msPatchMember(env, memberId, updates);
-      // Marque appliqué + map stripe customer -> member
       await kvSet(intentKey, { ...intent, status:'applied', appliedAt: Date.now() }, 60*60*24*30);
       await kvSet(evtKey, 1, 30*24*3600);
       if (stripeCustomerId){
         await kvSet(`map:scus:${env}:${stripeCustomerId}`, { memberId, email: emailKey || intent.email || null }, 30*24*3600);
       }
-      console.log(`[SUCCESS] Applied -> member=${memberId}, programs=${intent.programs.join(',')}`);
+      console.log(`[SUCCESS] Applied -> member=${memberId}, programs=${(intent.programs||[]).join(',')}`);
       console.log('=== WEBHOOK END (SUCCESS) ===');
       return res.status(200).send();
     }
+
     /* ========== DEACTIVATE ========== */
     if (DEACTIVATE.has(type)){
       console.log('[DEACTIVATE] Starting deactivation');
@@ -235,13 +273,15 @@ module.exports = async (req, res) => {
       console.log('=== WEBHOOK END (DEACT) ===');
       return res.status(200).send();
     }
+
     if (MAYBE.has(type)){
       console.log('[MAYBE] Skipping optional update');
       return res.status(200).send();
     }
+
     console.log('[OTHER] ACK non-action event');
     return res.status(200).send();
-  }catch(err){
+  } catch (err) {
     console.error('=== WEBHOOK ERROR ===', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
     console.log('=== WEBHOOK END (ERROR) ===');
