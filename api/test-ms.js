@@ -3,10 +3,11 @@ module.exports = async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const env = url.searchParams.get('env') || process.env.APP_ENV || 'test';  // Dynamique pour dual
   const key = env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE : process.env.MEMBERSTACK_API_KEY_TEST;
+  if (!key) throw new Error(`Missing Memberstack API key for ${env}`);
   console.log(`[${env.toUpperCase()}] Key prefix:`, key ? key.substring(0, 10) : 'MISS');
-  const r = await fetch('https://admin.memberstack.com/v2/members/mem_cmafsbtz700dl0wpv9csa0n8g', {  // Ton live memberId
+  const r = await fetch(`https://admin.memberstack.com/members/mem_cmafsbtz700dl0wpv9csa0n8g`, {  // Correct endpoint (no /v2), your live memberId
     method: 'PATCH',
-    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },  // Correct header (X-API-KEY, no Bearer)
     body: JSON.stringify({ customFields: { test: '1' } })
   });
   const txt = await r.text();
