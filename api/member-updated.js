@@ -5,7 +5,7 @@
  * - Check teamowner='1' + club + teamid
  * - Propagé via list all members + filter by teamid (fix 404 on /teams/{id})
  * - Svix + KV idempotence
- * - Env détecté from memberId ('sb' = test, else live; fallback APP_ENV)
+ * - Env 'test'
  */
 
 const fetch = require('node-fetch');
@@ -16,7 +16,7 @@ const { kvGet, kvSetEx } = require('./kv.js');
 function msApiKey(env) {
   return env === 'live'
     ? process.env.MEMBERSTACK_API_KEY_LIVE
-    : process.env.MEMBERSTACK_API_KEY_TEST;
+    : process.env.MEMBERSTACK_API_KEY_TEST || process.env.MEMBERSTACK_API_KEY;
 }
 function msHeaders(key) {
   return { 'X-API-KEY': key, 'Content-Type': 'application/json' };
@@ -69,118 +69,120 @@ async function msFindMemberIdByEmail(env, email){
   const txt = await r.text();
   if (!r.ok){
     if (r.status === 404) return null;
+    console.error('[MS-UPDATED] findByEmail ERROR', r.status, txt.substring(0,300));
     throw new Error(`MS query ${r.status}: ${txt}`);
   }
-  const d = JSON.parse(txt || '{}');
-  const id = d?.data?.[0]?.id ?? d?.id ?? null;
-  console.log('[MS-UPDATED] findByEmail result', { id });
+  let d;
+  try {
+    d = JSON.parse(txt || '{}');
+    d = d.data || d;
+  } catch (e) {
+    console.error('[MS-UPDATED] findByEmail parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  const id = Array.isArray(d) ? d[0]?.id : d?.id ?? null;
+  console.log('[MS-UPDATED] findByEmail resolved id', { id });
   return id || null;
 }
-async function msGetAllMembers(env, limit=1000){
+async function msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId) {
   const key = msApiKey(env);
   if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
-  const url = `https://admin.memberstack.com/members?page=1&limit=${limit}`;
-  console.log('[MS-UPDATED] getAll start', { env, keyPrefix: String(key).slice(0,6) });
+  const url = `https://admin.memberstack.com/members`; // List all members (assume <1000, no pagination for simplicity)
+  console.log('[MS-UPDATED] GET ALL MEMBERS start', { env, teamIdStr, keyPrefix: String(key).slice(0,6) });
   const r = await fetch(url, { headers: msHeaders(key) });
   const txt = await r.text();
-  console.log('[MS-UPDATED] getAll response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
-  if (!r.ok) throw new Error(`MS getAll ${r.status}: ${txt}`);
+  console.log('[MS-UPDATED] GET ALL MEMBERS response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) throw new Error(`MS get members ${r.status}: ${txt}`);
   let data;
   try {
     data = JSON.parse(txt || '{}');
-    data = data.data || data;
+    data = data.data || data; // Unwrap
   } catch (e) {
-    console.error('[MS-UPDATED] getAll parse error', e.message, txt.substring(0,300));
+    console.error('[MS-UPDATED] GET ALL MEMBERS parse error', e.message, txt.substring(0,300));
     throw e;
   }
-  console.log('[MS-UPDATED] getAll parsed', { count: data.length });
-  return data;
-}
-async function msGetTeamMembersByTeamId(env, teamIdStr, ownerId){
-  console.log('[MS-UPDATED] getTeamMembersByTeamId start', { env, teamIdStr, ownerId });
-  const allMembers = await msGetAllMembers(env);
-  const teamMembers = allMembers.filter(m => String(m.customFields?.teamid || '') === teamIdStr && m.id !== ownerId);
-  console.log('[MS-UPDATED] Filtered team members', { count: teamMembers.length });
+  console.log('[MS-UPDATED] GET ALL MEMBERS parsed', { totalMembers: (data || []).length });
+  const teamMembers = (Array.isArray(data) ? data : []).filter(m => String(m.customFields?.teamid || '') === teamIdStr && m.id !== updatedMemberId);
+  console.log('[MS-UPDATED] Filtered team members', { count: teamMembers.length, teamIdStr });
   return teamMembers;
 }
-/* --- Handler --- */
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-  let rawBody;
-  try {
-    rawBody = await new Promise((resolve, reject) => {
-      let body = '';
-      req.on('data', chunk => body += chunk);
-      req.on('end', () => resolve(body));
+async function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    try {
+      const chunks = [];
+      req.on('data', c => chunks.push(Buffer.from(c)));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
       req.on('error', reject);
-    });
-    console.log('[MS-UPDATED] Raw body received', { length: rawBody.length, preview: rawBody.substring(0,200) });
-  } catch (e) {
-    console.error('[MS-UPDATED] Body read error', e.message);
-    return res.status(400).send('Invalid request');
-  }
-  let payload;
+    } catch (err) { reject(err); }
+  });
+}
+
+/* --- Handler Dédié --- */
+module.exports = async (req, res) => {
+  console.log('[MS-UPDATED] Handler start', { method: req.method, url: req.url });
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, svix-signature, svix-timestamp');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  let raw;
   try {
-    payload = JSON.parse(rawBody);
+    raw = await readRawBody(req);
+    console.log('[MS-UPDATED] Raw body received', { length: raw.length, preview: raw.toString().substring(0,200) });
   } catch (e) {
-    console.error('[MS-UPDATED] Parse error', e.message, rawBody.substring(0,300));
-    return res.status(400).send('Invalid JSON');
+    console.error('[MS-UPDATED] readRawBody error', e.message);
+    return res.status(400).send('Invalid body');
   }
-  // Detect env from payload memberId (fallback APP_ENV or 'test')
-  const memberId = payload.payload?.id || payload.payload?.auth?.email || '';
-  let env = process.env.APP_ENV || 'test';
-  if (memberId) {
-    env = memberId.includes('sb') ? 'test' : 'live';
-  }
-  console.log('[MS-UPDATED] Handler start', { env, detectedFrom: memberId });
-  const msWebhookSecret = env === 'live' ? process.env.MS_WEBHOOK_SECRET_UPDATED_LIVE : process.env.MS_WEBHOOK_SECRET_UPDATED_TEST;
+  const payloadStr = raw.toString();
+  const headers = req.headers;
+  const svix_signature = headers['svix-signature'];
+  const svix_timestamp = headers['svix-timestamp'];
+  const svix_id = headers['svix-id'];
+  console.log('[MS-UPDATED] Svix headers', { svix_id: svix_id ? svix_id.substring(0,20) + '...' : 'MISSING' });
+  const env = 'test'; // Forcé
+  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_UPDATED;
   if (!msWebhookSecret) {
     console.error('[MS-UPDATED] Secret missing', { env });
-    return res.status(403).send('Missing secret');
+    return res.status(500).send('MS_WEBHOOK_SECRET_UPDATED missing');
   }
-  const svix_id = req.headers['svix-id'];
-  const svix_timestamp = req.headers['svix-timestamp'];
-  const svix_signature = req.headers['svix-signature'];
-  console.log('[MS-UPDATED] Svix headers', { svix_id });
-  if (!svix_id || !svix_timestamp || !svix_signature) {
-    console.error('[MS-UPDATED] Missing Svix headers');
-    return res.status(400).send('Missing headers');
-  }
-  const wh = new Webhook(msWebhookSecret);
-  let evt;
+  let event;
   try {
-    evt = wh.verify(rawBody, {
+    const wh = new Webhook(msWebhookSecret);
+    const payload = Buffer.from(payloadStr, 'utf-8');
+    const headersObj = {
       'svix-id': svix_id,
       'svix-timestamp': svix_timestamp,
       'svix-signature': svix_signature
-    });
-  } catch (err) {
-    console.error('[MS-UPDATED] Verify error', err.message);
-    return res.status(400).send('Invalid signature');
+    };
+    event = wh.verify(payload, headersObj);
+    console.log('[MS-UPDATED] Signature verified OK', { eventType: event.type });
+  } catch (e) {
+    console.error('[MS-UPDATED] Svix verify error', { message: e.message });
+    return res.status(400).send('Webhook signature error');
   }
-  const type = payload.event;  // Correct for Memberstack payloads
-  if (!type) {
-    console.error('[MS-UPDATED] No event type');
-    return res.status(400).send('No event type');
-  }
-  console.log('[MS-UPDATED] Event type', type);
+  const fullPayload = JSON.parse(payloadStr);
+  console.log('[MS-UPDATED] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}) });
+  const type = fullPayload.event;
+  const payloadData = fullPayload.payload || {};
+  let updatedMemberId;
   if (type !== 'member.updated') {
     console.log('[MS-UPDATED] Skip non-updated event', type);
-    return res.status(200).send();
+    return res.status(200).send(); // Skip autres events
   }
-  const evtKey = `ms-updated-processed:${env}:${svix_id}`;
+  // Résout ID
+  updatedMemberId = payloadData.id;
+  if (!updatedMemberId && payloadData.auth && payloadData.auth.email) {
+    console.log('[MS-UPDATED] No direct id, resolving via email', { email: payloadData.auth.email });
+    updatedMemberId = await msFindMemberIdByEmail(env, payloadData.auth.email);
+  }
+  console.log('=== MS-UPDATED START ===', { updatedMemberId });
+  const evtKey = `ms-updated-processed:${env}:${svix_id}`; // KV clé dédiée
   const processed = await kvGet(evtKey);
   if (processed) {
     console.log('[MS-UPDATED] Already processed', processed, 'skip');
     return res.status(200).send();
   }
   try {
-    let updatedMemberId = payload.payload?.id;
-    if (!updatedMemberId && payload.payload?.auth?.email) {
-      console.log('[MS-UPDATED] No direct id, resolving via email', { email: payload.payload.auth.email });
-      updatedMemberId = await msFindMemberIdByEmail(env, payload.payload.auth.email);
-    }
-    console.log('=== MS-UPDATED START ===', { updatedMemberId });
     if (!updatedMemberId) {
       console.log('[MS-UPDATED] Missing updatedMemberId');
       await kvSetEx(evtKey, 1, 3600);
