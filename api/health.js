@@ -10,7 +10,7 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok:true, ts: Date.now() });
     }
 
-    const env = url.searchParams.get('env') || 'test';
+    const env = url.searchParams.get('env') || process.env.APP_ENV || 'test';  // Dynamique pour dual
     const email = (url.searchParams.get('email') || '').trim().toLowerCase();
     const memberId = (url.searchParams.get('memberId') || '').trim();
     const mirror = env === 'live' ? 'test' : 'live';
