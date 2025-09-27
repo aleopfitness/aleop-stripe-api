@@ -5,7 +5,7 @@
  * - Check teamowner='1' + club + teamid
  * - Propagé via list all members + filter by teamid (fix 404 on /teams/{id})
  * - Svix + KV idempotence
- * - Env dynamique (APP_ENV default pour webhooks)
+ * - Env détecté from memberId ('sb' = test, else live; fallback APP_ENV)
  */
 
 const fetch = require('node-fetch');
@@ -106,13 +106,6 @@ async function msGetTeamMembersByTeamId(env, teamIdStr, ownerId){
 /* --- Handler --- */
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-  const env = process.env.APP_ENV || 'test';  // Dynamique pour webhooks (no query)
-  console.log('[MS-UPDATED] Handler start', { env });
-  const msWebhookSecret = env === 'live' ? process.env.MS_WEBHOOK_SECRET_UPDATED_LIVE : process.env.MS_WEBHOOK_SECRET_UPDATED_TEST;
-  if (!msWebhookSecret) {
-    console.error('[MS-UPDATED] Secret missing', { env });
-    return res.status(403).send('Missing secret');
-  }
   let rawBody;
   try {
     rawBody = await new Promise((resolve, reject) => {
@@ -133,89 +126,8 @@ module.exports = async (req, res) => {
     console.error('[MS-UPDATED] Parse error', e.message, rawBody.substring(0,300));
     return res.status(400).send('Invalid JSON');
   }
-  const type = payload.type;
-  const svix_id = req.headers['svix-id'];
-  const svix_timestamp = req.headers['svix-timestamp'];
-  const svix_signature = req.headers['svix-signature'];
-  console.log('[MS-UPDATED] Svix headers', { svix_id });
-  if (!svix_id || !svix_timestamp || !svix_signature) {
-    console.error('[MS-UPDATED] Missing Svix headers');
-    return res.status(400).send('Missing headers');
-  }
-  const wh = new Webhook(msWebhookSecret);
-  let evt;
-  try {
-    evt = wh.verify(rawBody, {
-      'svix-id': svix_id,
-      'svix-timestamp': svix_timestamp,
-      'svix-signature': svix_signature
-    });
-  } catch (err) {
-    console.error('[MS-UPDATED] Verify error', err.message);
-    return res.status(400).send('Invalid signature');
-  }
-  const payloadData = evt.data || {};
-  let updatedMemberId;
-  if (type !== 'member.updated') {
-    console.log('[MS-UPDATED] Skip non-updated event', type);
-    return res.status(200).send(); // Skip autres events
-  }
-  // Résout ID
-  updatedMemberId = payloadData.id;
-  if (!updatedMemberId && payloadData.auth && payloadData.auth.email) {
-    console.log('[MS-UPDATED] No direct id, resolving via email', { email: payloadData.auth.email });
-    updatedMemberId = await msFindMemberIdByEmail(env, payloadData.auth.email);
-  }
-  console.log('=== MS-UPDATED START ===', { updatedMemberId });
-  const evtKey = `ms-updated-processed:${env}:${svix_id}`; // KV clé dédiée
-  const processed = await kvGet(evtKey);
-  if (processed) {
-    console.log('[MS-UPDATED] Already processed', processed, 'skip');
-    return res.status(200).send();
-  }
-  try {
-    if (!updatedMemberId) {
-      console.log('[MS-UPDATED] Missing updatedMemberId');
-      await kvSetEx(evtKey, 1, 3600);
-      return res.status(200).send();
-    }
-    let updatedMember;
-    try {
-      updatedMember = await msGetMember(env, updatedMemberId);
-    } catch (e) {
-      console.error('[MS-UPDATED] msGetMember error', { updatedMemberId, eMessage: e.message });
-      await kvSetEx(evtKey, 1, 3600);
-      return res.status(200).send();
-    }
-    const customFields = updatedMember.customFields || {};
-    console.log('[MS-UPDATED] Updated member fields', { updatedMemberId, teamowner: customFields.teamowner, club: customFields.club, teamid: customFields.teamid });
-    // Propagation seulement si teamowner et club/teamid
-    if (String(customFields.teamowner || '') === '1' && customFields.club && customFields.teamid) {
-      const teamIdStr = String(customFields.teamid);
-      const newClub = String(customFields.club);
-      console.log('[MS-UPDATED] Owner updated club, propagating', { updatedMemberId, teamid: teamIdStr, newClub });
-      const teamMembers = await msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId);
-      let updatedCount = 0;
-      for (const tm of teamMembers) {
-        const tmId = tm.id;
-        console.log('[MS-UPDATED] Updating club for member', { tmId, newClub });
-        try {
-          await msPatchMember(env, tmId, { club: newClub });
-          updatedCount++;
-        } catch (patchErr) {
-          console.error('[MS-UPDATED] Patch error', { tmId, err: patchErr.message });
-        }
-      }
-      console.log(`[MS-UPDATED] Propagated club to ${updatedCount} members`);
-    } else {
-      console.log('[MS-UPDATED] Skip propagation', { teamowner: customFields.teamowner, hasClub: !!customFields.club, hasTeamid: !!customFields.teamid });
-    }
-    await kvSetEx(evtKey, 1, 30 * 24 * 3600);
-    console.log('=== MS-UPDATED END (SUCCESS) ===');
-    return res.status(200).send();
-  } catch (err) {
-    console.error('=== MS-UPDATED ERROR ===', { message: err.message, stack: err.stack });
-    await kvSetEx(evtKey, 1, 3600);
-    return res.status(500).send('Handler error');
-  }
-};
+  // Detect env from payload memberId (fallback APP_ENV or 'test')
+  const memberId = payload.payload?.id || payload.payload?.auth?.email || '';
+  let env = process.env.APP_ENV || 'test';
+  if (memberId) {
+    env = memberId.includes('sb') ? 'test'
