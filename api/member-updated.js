@@ -133,6 +133,33 @@ async function msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId) {
     console.error('[MS-UPDATED] GET ALL MEMBERS parse error', e.message, txt.substring(0,300));
     throw e;
   }
+
+
+async function msGetTeam(env, teamId) {
+  const key = msApiKey(env);
+  if (!key) throw new Error(`Missing Memberstack API key for env=${env}`);
+  const url = `https://admin.memberstack.com/teams/${teamId}`;
+  console.log('[MS-UPDATED] GET TEAM start', { env, teamId, keyPrefix: String(key).slice(0,6) });
+  const r = await fetch(url, { headers: msHeaders(key) });
+  const txt = await r.text();
+  console.log('[MS-UPDATED] GET TEAM response raw', { status: r.status, txtLength: txt.length, txtPreview: txt.substring(0,200) });
+  if (!r.ok) {
+    console.error('[MS-UPDATED] GET TEAM error', { status: r.status, txt: txt.substring(0,200) });
+    throw new Error(`MS get team ${r.status}`);
+  }
+  let data;
+  try {
+    data = JSON.parse(txt || '{}');
+    data = data.data || data;
+  } catch (e) {
+    console.error('[MS-UPDATED] GET TEAM parse error', e.message, txt.substring(0,300));
+    throw e;
+  }
+  const members = data.members || data.teamMembers || [];
+  console.log('[MS-UPDATED] GET TEAM parsed', { count: Array.isArray(members) ? members.length : 0, keys: Object.keys(data || {}) });
+  return Array.isArray(members) ? members : [];
+}
+
   console.log('[MS-UPDATED] GET ALL MEMBERS parsed', { totalMembers: (data || []).length });
   const teamMembers = (Array.isArray(data) ? data : []).filter(m => String(m.customFields?.teamid || '') === teamIdStr && m.id !== updatedMemberId);
   console.log('[MS-UPDATED] Filtered team members', { count: teamMembers.length, teamIdStr });
@@ -223,7 +250,16 @@ try {
       const teamIdStr = String(customFields.teamid);
       const newClub = String(customFields.club);
       console.log('[MS-UPDATED] Owner updated club, propagating', { updatedMemberId, teamid: teamIdStr, newClub });
-      const teamMembers = await msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId);
+      let teamMembers = [];
+try {
+  teamMembers = await msGetTeam(env, teamIdStr);
+} catch (e) {
+  console.warn('[MS-UPDATED] GET TEAM failed, fallback to list-members filter', { message: e.message });
+  teamMembers = await msGetTeamMembersByTeamId(env, teamIdStr, updatedMemberId);
+}
+// Normalize structure to have .id and .customFields for downstream
+teamMembers = teamMembers.map(m => ({ id: m.id || m.memberId || m.member?.id, customFields: m.customFields || m.member?.customFields || {} }))
+
       let updatedCount = 0;
       
 for (const tm of teamMembers) {
