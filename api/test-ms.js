@@ -8,7 +8,7 @@ module.exports = async (req, res) => {
   const r = await fetch(`https://admin.memberstack.com/members/mem_cmafsbtz700dl0wpv9csa0n8g`, {  // Correct endpoint (no /v2), your live memberId
     method: 'PATCH',
     headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },  // Correct header (X-API-KEY, no Bearer)
-    body: JSON.stringify({ customFields: { test: '1' } })
+    body: JSON.stringify({ customFields: { upper: '0' } })
   });
   const txt = await r.text();
   console.log(`[${env.toUpperCase()}] Status:`, r.status, txt);
