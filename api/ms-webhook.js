@@ -5,7 +5,7 @@
  * - Event: team.member.removed → deactivate
  * - Event: member.updated → si owner update club, propage à tous les members de la team (via teamid stocké)
  * - Svix signature vérifiée proprement (direct verify, sans createMessage)
- * - Env dynamique (APP_ENV default, fallback 'live')
+ * - Env détecté from payload memberId ( 'sb' = test, else live)
  * - Logs détaillés pour debug
  * - Fix: evtKey sur svix_id pour idempotence robuste
  * - Fix: kvSetEx au lieu de kvSet (match export kv.js)
@@ -93,13 +93,6 @@ function buildFlags(programs, active=true) {
 /* --- Handler --- */
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-  const env = process.env.APP_ENV || 'live';  // Dynamique, fallback 'live'
-  console.log('[MS] Handler start', { env });
-  const msWebhookSecret = env === 'live' ? process.env.MS_WEBHOOK_SECRET_LIVE : process.env.MS_WEBHOOK_SECRET_TEST;
-  if (!msWebhookSecret) {
-    console.error('[MS] Secret missing', { env });
-    return res.status(403).send('Missing secret');
-  }
   let rawBody;
   try {
     rawBody = await new Promise((resolve, reject) => {
@@ -120,7 +113,16 @@ module.exports = async (req, res) => {
     console.error('[MS] Parse error', e.message, rawBody.substring(0,300));
     return res.status(400).send('Invalid JSON');
   }
-  const type = payload.event;  // Fix: Use 'event' key
+  // Detect env from payload memberId
+  const memberId = payload.payload?.memberId || payload.payload?.ownerId || payload.payload?.id || '';
+  const env = memberId.includes('sb') ? 'test' : 'live';  // 'sb' for test, else live
+  console.log('[MS] Handler start', { env, detectedFrom: memberId });
+  const msWebhookSecret = env === 'live' ? process.env.MS_WEBHOOK_SECRET_LIVE : process.env.MS_WEBHOOK_SECRET_TEST;
+  if (!msWebhookSecret) {
+    console.error('[MS] Secret missing', { env });
+    return res.status(403).send('Missing secret');
+  }
+  const type = payload.event;  // Correct key 'event'
   const svix_id = req.headers['svix-id'];
   const svix_timestamp = req.headers['svix-timestamp'];
   const svix_signature = req.headers['svix-signature'];
