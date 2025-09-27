@@ -5,7 +5,7 @@
  * - Check teamowner='1' + club + teamid
  * - Propagé via list all members + filter by teamid (fix 404 on /teams/{id})
  * - Svix + KV idempotence
- * - Env 'test'
+ * - Env auto via signature (LIVE→TEST)
  */
 
 const fetch = require('node-fetch');
@@ -139,28 +139,34 @@ module.exports = async (req, res) => {
   const svix_timestamp = headers['svix-timestamp'];
   const svix_id = headers['svix-id'];
   console.log('[MS-UPDATED] Svix headers', { svix_id: svix_id ? svix_id.substring(0,20) + '...' : 'MISSING' });
-  const env = 'test'; // Forcé
-  const msWebhookSecret = process.env.MS_WEBHOOK_SECRET_UPDATED;
-  if (!msWebhookSecret) {
-    console.error('[MS-UPDATED] Secret missing', { env });
-    return res.status(500).send('MS_WEBHOOK_SECRET_UPDATED missing');
-  }
+  
+  // --- Detect env by verifying Svix signature with UPDATED secrets (LIVE→TEST) ---
+  let env = 'live';
+  let msWebhookSecret = process.env.MS_WEBHOOK_SECRET_UPDATED_LIVE;
   let event;
+  const headersObj = {
+    'svix-id': svix_id,
+    'svix-timestamp': svix_timestamp,
+    'svix-signature': svix_signature
+  };
   try {
-    const wh = new Webhook(msWebhookSecret);
-    const payload = Buffer.from(payloadStr, 'utf-8');
-    const headersObj = {
-      'svix-id': svix_id,
-      'svix-timestamp': svix_timestamp,
-      'svix-signature': svix_signature
-    };
-    event = wh.verify(payload, headersObj);
-    console.log('[MS-UPDATED] Signature verified OK', { eventType: event.type });
-  } catch (e) {
-    console.error('[MS-UPDATED] Svix verify error', { message: e.message });
-    return res.status(400).send('Webhook signature error');
+    if (!msWebhookSecret) throw new Error('Missing UPDATED_LIVE secret');
+    event = new Webhook(msWebhookSecret).verify(Buffer.from(payloadStr, 'utf-8'), headersObj);
+    console.log('[MS-UPDATED] Signature verified with UPDATED_LIVE secret');
+  } catch (eLive) {
+    console.warn('[MS-UPDATED] UPDATED_LIVE verify failed, trying UPDATED_TEST:', eLive.message);
+    env = 'test';
+    msWebhookSecret = process.env.MS_WEBHOOK_SECRET_UPDATED_TEST;
+    try {
+      if (!msWebhookSecret) throw new Error('Missing UPDATED_TEST secret');
+      event = new Webhook(msWebhookSecret).verify(Buffer.from(payloadStr, 'utf-8'), headersObj);
+      console.log('[MS-UPDATED] Signature verified with UPDATED_TEST secret');
+    } catch (eTest) {
+      console.error('[MS-UPDATED] Svix verify failed for both UPDATED_LIVE and UPDATED_TEST', { eLive: eLive.message, eTest: eTest.message });
+      return res.status(400).send('Webhook signature error');
+    }
   }
-  const fullPayload = JSON.parse(payloadStr);
+const fullPayload = JSON.parse(payloadStr);
   console.log('[MS-UPDATED] Full payload parsed', { event: fullPayload.event, payloadKeys: Object.keys(fullPayload.payload || {}) });
   const type = fullPayload.event;
   const payloadData = fullPayload.payload || {};
