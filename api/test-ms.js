@@ -1,12 +1,15 @@
 const fetch = require('node-fetch');
 module.exports = async (req, res) => {
-  const key = process.env.MEMBERSTACK_API_KEY_TEST;
-  console.log('[TEST] Key prefix:', key ? key.substring(0, 10) : 'MISS');
-  const r = await fetch('https://admin.memberstack.com/v2/members/mem_sb_cmeh0l3bz000f0xknf05h45zf', { // Ton memberId test
+  const url = new URL(req.url, 'http://x');
+  const env = url.searchParams.get('env') || process.env.APP_ENV || 'test';  // Dynamique pour dual
+  const key = env === 'live' ? process.env.MEMBERSTACK_API_KEY_LIVE : process.env.MEMBERSTACK_API_KEY_TEST;
+  console.log(`[${env.toUpperCase()}] Key prefix:`, key ? key.substring(0, 10) : 'MISS');
+  const r = await fetch('https://admin.memberstack.com/v2/members/mem_cmafsbtz700dl0wpv9csa0n8g', {  // Ton live memberId
     method: 'PATCH',
     headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ customFields: { test: '1' } })
   });
-  console.log('[TEST] Status:', r.status, await r.text());
-  res.json({ status: r.status });
+  const txt = await r.text();
+  console.log(`[${env.toUpperCase()}] Status:`, r.status, txt);
+  res.json({ status: r.status, env });
 };
